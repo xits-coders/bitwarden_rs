@@ -7,7 +7,6 @@ macro_rules! make_error {
     ( $( $name:ident ( $ty:ty ): $src_fn:expr, $usr_msg_fun:expr ),+ $(,)? ) => {
         const BAD_REQUEST: u16 = 400;
 
-        #[derive(Display)]
         pub enum ErrorKind { $($name( $ty )),+ }
         pub struct Error { message: String, error: ErrorKind, error_code: u16 }
 
@@ -35,6 +34,9 @@ macro_rules! make_error {
 }
 
 use diesel::result::Error as DieselErr;
+use diesel::ConnectionError as DieselConErr;
+use diesel_migrations::RunMigrationsError as DieselMigErr;
+use diesel::r2d2::PoolError as R2d2Err;
 use handlebars::RenderError as HbErr;
 use jsonwebtoken::errors::Error as JWTErr;
 use regex::Error as RegexErr;
@@ -42,12 +44,16 @@ use reqwest::Error as ReqErr;
 use serde_json::{Error as SerdeErr, Value};
 use std::io::Error as IOErr;
 
-use std::option::NoneError as NoneErr;
 use std::time::SystemTimeError as TimeErr;
 use u2f::u2ferror::U2fError as U2fErr;
 use yubico::yubicoerror::YubicoError as YubiErr;
 
-#[derive(Display, Serialize)]
+use lettre::address::AddressError as AddrErr;
+use lettre::error::Error as LettreErr;
+use lettre::message::mime::FromStrError as FromStrErr;
+use lettre::transport::smtp::Error as SmtpErr;
+
+#[derive(Serialize)]
 pub struct Empty {}
 
 // Error struct
@@ -63,6 +69,7 @@ make_error! {
     // Used for special return values, like 2FA errors
     JsonError(Value):     _no_source,  _serialize,
     DbError(DieselErr):   _has_source, _api_error,
+    R2d2Error(R2d2Err):   _has_source, _api_error,
     U2fError(U2fErr):     _has_source, _api_error,
     SerdeError(SerdeErr): _has_source, _api_error,
     JWTError(JWTErr):     _has_source, _api_error,
@@ -73,20 +80,32 @@ make_error! {
     ReqError(ReqErr):     _has_source, _api_error,
     RegexError(RegexErr): _has_source, _api_error,
     YubiError(YubiErr):   _has_source, _api_error,
-}
 
-// This is implemented by hand because NoneError doesn't implement neither Display nor Error
-impl From<NoneErr> for Error {
-    fn from(_: NoneErr) -> Self {
-        Error::from(("NoneError", String::new()))
-    }
+    LettreError(LettreErr):   _has_source, _api_error,
+    AddressError(AddrErr):    _has_source, _api_error,
+    SmtpError(SmtpErr):       _has_source, _api_error,
+    FromStrError(FromStrErr): _has_source, _api_error,
+
+    DieselConError(DieselConErr): _has_source, _api_error,
+    DieselMigError(DieselMigErr): _has_source, _api_error,
 }
 
 impl std::fmt::Debug for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self.source() {
             Some(e) => write!(f, "{}.\n[CAUSE] {:#?}", self.message, e),
-            None => write!(f, "{}. {}", self.message, self.error),
+            None => match self.error {
+                ErrorKind::EmptyError(_) => Ok(()),
+                ErrorKind::SimpleError(ref s) => {
+                    if &self.message == s {
+                        write!(f, "{}", self.message)
+                    } else {
+                        write!(f, "{}. {}", self.message, s)
+                    }
+                }
+                ErrorKind::JsonError(_) => write!(f, "{}", self.message),
+                _ => unreachable!(),
+            },
         }
     }
 }
@@ -105,7 +124,7 @@ impl Error {
         self
     }
 
-    pub fn with_code(mut self, code: u16) -> Self {
+    pub const fn with_code(mut self, code: u16) -> Self {
         self.error_code = code;
         self
     }
@@ -133,7 +152,7 @@ impl<S> MapResult<S> for Option<S> {
     }
 }
 
-fn _has_source<T>(e: T) -> Option<T> {
+const fn _has_source<T>(e: T) -> Option<T> {
     Some(e)
 }
 fn _no_source<T, S>(_: T) -> Option<S> {
@@ -170,15 +189,18 @@ use rocket::response::{self, Responder, Response};
 
 impl<'r> Responder<'r> for Error {
     fn respond_to(self, _: &Request) -> response::Result<'r> {
-        let usr_msg = format!("{}", self);
-        error!("{:#?}", self);
+        match self.error {
+            ErrorKind::EmptyError(_) => {} // Don't print the error in this situation
+            ErrorKind::SimpleError(_) => {} // Don't print the error in this situation
+            _ => error!(target: "error", "{:#?}", self),
+        };
 
         let code = Status::from_code(self.error_code).unwrap_or(Status::BadRequest);
 
         Response::build()
             .status(code)
             .header(ContentType::JSON)
-            .sized_body(Cursor::new(usr_msg))
+            .sized_body(Cursor::new(format!("{}", self)))
             .ok()
     }
 }
@@ -189,28 +211,42 @@ impl<'r> Responder<'r> for Error {
 #[macro_export]
 macro_rules! err {
     ($msg:expr) => {{
+        error!("{}", $msg);
         return Err(crate::error::Error::new($msg, $msg));
     }};
     ($usr_msg:expr, $log_value:expr) => {{
+        error!("{}. {}", $usr_msg, $log_value);
+        return Err(crate::error::Error::new($usr_msg, $log_value));
+    }};
+}
+
+#[macro_export]
+macro_rules! err_discard {
+    ($msg:expr, $data:expr) => {{
+        std::io::copy(&mut $data.open(), &mut std::io::sink()).ok();
+        return Err(crate::error::Error::new($msg, $msg));
+    }};
+    ($usr_msg:expr, $log_value:expr, $data:expr) => {{
+        std::io::copy(&mut $data.open(), &mut std::io::sink()).ok();
         return Err(crate::error::Error::new($usr_msg, $log_value));
     }};
 }
 
 #[macro_export]
 macro_rules! err_json {
-    ($expr:expr) => {{
-        return Err(crate::error::Error::from($expr));
+    ($expr:expr, $log_value:expr) => {{
+        return Err(($log_value, $expr).into());
     }};
 }
 
 #[macro_export]
 macro_rules! err_handler {
     ($expr:expr) => {{
-        error!("Unauthorized Error: {}", $expr);
-        return rocket::Outcome::Failure((rocket::http::Status::Unauthorized, $expr));
+        error!(target: "auth", "Unauthorized Error: {}", $expr);
+        return ::rocket::request::Outcome::Failure((rocket::http::Status::Unauthorized, $expr));
     }};
     ($usr_msg:expr, $log_value:expr) => {{
-        error!("Unauthorized Error: {}. {}", $usr_msg, $log_value);
-        return rocket::Outcome::Failure((rocket::http::Status::Unauthorized, $usr_msg));
+        error!(target: "auth", "Unauthorized Error: {}. {}", $usr_msg, $log_value);
+        return ::rocket::request::Outcome::Failure((rocket::http::Status::Unauthorized, $usr_msg));
     }};
 }

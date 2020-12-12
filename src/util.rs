@@ -1,9 +1,16 @@
 //
 // Web Headers and caching
 //
-use rocket::fairing::{Fairing, Info, Kind};
-use rocket::response::{self, Responder};
-use rocket::{Request, Response};
+use std::io::Cursor;
+
+use rocket::{
+    fairing::{Fairing, Info, Kind},
+    http::{ContentType, Header, HeaderMap, Method, Status},
+    response::{self, Responder},
+    Data, Request, Response, Rocket,
+};
+
+use crate::CONFIG;
 
 pub struct AppHeaders();
 
@@ -21,7 +28,7 @@ impl Fairing for AppHeaders {
         res.set_raw_header("X-Frame-Options", "SAMEORIGIN");
         res.set_raw_header("X-Content-Type-Options", "nosniff");
         res.set_raw_header("X-XSS-Protection", "1; mode=block");
-        let csp = "frame-ancestors 'self' chrome-extension://nngceckbapebfimnlniiiahkandclblb moz-extension://*;";
+        let csp = format!("frame-ancestors 'self' chrome-extension://nngceckbapebfimnlniiiahkandclblb moz-extension://* {};", CONFIG.allowed_iframe_ancestors());
         res.set_raw_header("Content-Security-Policy", csp);
 
         // Disable cache unless otherwise specified
@@ -31,17 +38,65 @@ impl Fairing for AppHeaders {
     }
 }
 
+pub struct CORS();
+
+impl CORS {
+    fn get_header(headers: &HeaderMap, name: &str) -> String {
+        match headers.get_one(name) {
+            Some(h) => h.to_string(),
+            _ => "".to_string(),
+        }
+    }
+
+    fn valid_url(url: String) -> String {
+        match url.as_ref() {
+            "file://" => "*".to_string(),
+            _ => url,
+        }
+    }
+}
+
+impl Fairing for CORS {
+    fn info(&self) -> Info {
+        Info {
+            name: "CORS",
+            kind: Kind::Response,
+        }
+    }
+
+    fn on_response(&self, request: &Request, response: &mut Response) {
+        let req_headers = request.headers();
+
+        // We need to explicitly get the Origin header for Access-Control-Allow-Origin
+        let req_allow_origin = CORS::valid_url(CORS::get_header(req_headers, "Origin"));
+
+        response.set_header(Header::new("Access-Control-Allow-Origin", req_allow_origin));
+
+        if request.method() == Method::Options {
+            let req_allow_headers = CORS::get_header(req_headers, "Access-Control-Request-Headers");
+            let req_allow_method = CORS::get_header(req_headers, "Access-Control-Request-Method");
+
+            response.set_header(Header::new("Access-Control-Allow-Methods", req_allow_method));
+            response.set_header(Header::new("Access-Control-Allow-Headers", req_allow_headers));
+            response.set_header(Header::new("Access-Control-Allow-Credentials", "true"));
+            response.set_status(Status::Ok);
+            response.set_header(ContentType::Plain);
+            response.set_sized_body(Cursor::new(""));
+        }
+    }
+}
+
 pub struct Cached<R>(R, &'static str);
 
 impl<R> Cached<R> {
-    pub fn long(r: R) -> Cached<R> {
+    pub const fn long(r: R) -> Cached<R> {
         // 7 days
-        Cached(r, "public, max-age=604800")
+        Self(r, "public, max-age=604800")
     }
 
-    pub fn short(r: R) -> Cached<R> {
+    pub const fn short(r: R) -> Cached<R> {
         // 10 minutes
-        Cached(r, "public, max-age=600")
+        Self(r, "public, max-age=600")
     }
 }
 
@@ -57,12 +112,88 @@ impl<'r, R: Responder<'r>> Responder<'r> for Cached<R> {
     }
 }
 
+// Log all the routes from the main paths list, and the attachments endpoint
+// Effectively ignores, any static file route, and the alive endpoint
+const LOGGED_ROUTES: [&str; 6] = [
+    "/api",
+    "/admin",
+    "/identity",
+    "/icons",
+    "/notifications/hub/negotiate",
+    "/attachments",
+];
+
+// Boolean is extra debug, when true, we ignore the whitelist above and also print the mounts
+pub struct BetterLogging(pub bool);
+impl Fairing for BetterLogging {
+    fn info(&self) -> Info {
+        Info {
+            name: "Better Logging",
+            kind: Kind::Launch | Kind::Request | Kind::Response,
+        }
+    }
+
+    fn on_launch(&self, rocket: &Rocket) {
+        if self.0 {
+            info!(target: "routes", "Routes loaded:");
+            let mut routes: Vec<_> = rocket.routes().collect();
+            routes.sort_by_key(|r| r.uri.path());
+            for route in routes {
+                if route.rank < 0 {
+                    info!(target: "routes", "{:<6} {}", route.method, route.uri);
+                } else {
+                    info!(target: "routes", "{:<6} {} [{}]", route.method, route.uri, route.rank);
+                }
+            }
+        }
+
+        let config = rocket.config();
+        let scheme = if config.tls_enabled() { "https" } else { "http" };
+        let addr = format!("{}://{}:{}", &scheme, &config.address, &config.port);
+        info!(target: "start", "Rocket has launched from {}", addr);
+    }
+
+    fn on_request(&self, request: &mut Request<'_>, _data: &Data) {
+        let method = request.method();
+        if !self.0 && method == Method::Options {
+            return;
+        }
+        let uri = request.uri();
+        let uri_path = uri.path();
+        let uri_subpath = uri_path.strip_prefix(&CONFIG.domain_path()).unwrap_or(uri_path);
+        if self.0 || LOGGED_ROUTES.iter().any(|r| uri_subpath.starts_with(r)) {
+            match uri.query() {
+                Some(q) => info!(target: "request", "{} {}?{}", method, uri_path, &q[..q.len().min(30)]),
+                None => info!(target: "request", "{} {}", method, uri_path),
+            };
+        }
+    }
+
+    fn on_response(&self, request: &Request, response: &mut Response) {
+        if !self.0 && request.method() == Method::Options {
+            return;
+        }
+        let uri_path = request.uri().path();
+        let uri_subpath = uri_path.strip_prefix(&CONFIG.domain_path()).unwrap_or(uri_path);
+        if self.0 || LOGGED_ROUTES.iter().any(|r| uri_subpath.starts_with(r)) {
+            let status = response.status();
+            if let Some(route) = request.route() {
+                info!(target: "response", "{} => {} {}", route, status.code, status.reason)
+            } else {
+                info!(target: "response", "{} {}", status.code, status.reason)
+            }
+        }
+    }
+}
+
 //
 // File handling
 //
-use std::fs::{self, File};
-use std::io::{Read, Result as IOResult};
-use std::path::Path;
+use std::{
+    fs::{self, File},
+    io::{Read, Result as IOResult},
+    path::Path,
+};
 
 pub fn file_exists(path: &str) -> bool {
     Path::new(path).exists()
@@ -113,9 +244,7 @@ pub fn get_display_size(size: i32) -> String {
         }
     }
 
-    // Round to two decimals
-    size = (size * 100.).round() / 100.;
-    format!("{} {}", size, UNITS[unit_counter])
+    format!("{:.2} {}", size, UNITS[unit_counter])
 }
 
 pub fn get_uuid() -> String {
@@ -126,7 +255,6 @@ pub fn get_uuid() -> String {
 // String util methods
 //
 
-use std::ops::Try;
 use std::str::FromStr;
 
 pub fn upcase_first(s: &str) -> String {
@@ -137,12 +265,12 @@ pub fn upcase_first(s: &str) -> String {
     }
 }
 
-pub fn try_parse_string<S, T, U>(string: impl Try<Ok = S, Error = U>) -> Option<T>
+pub fn try_parse_string<S, T>(string: Option<S>) -> Option<T>
 where
     S: AsRef<str>,
     T: FromStr,
 {
-    if let Ok(Ok(value)) = string.into_result().map(|s| s.as_ref().parse::<T>()) {
+    if let Some(Ok(value)) = string.map(|s| s.as_ref().parse::<T>()) {
         Some(value)
     } else {
         None
@@ -155,11 +283,39 @@ where
 
 use std::env;
 
+pub fn get_env_str_value(key: &str) -> Option<String>
+{
+    let key_file = format!("{}_FILE", key);
+    let value_from_env = env::var(key);
+    let value_file = env::var(&key_file);
+
+    match (value_from_env, value_file) {
+        (Ok(_), Ok(_)) => panic!("You should not define both {} and {}!", key, key_file),
+        (Ok(v_env), Err(_)) => Some(v_env),
+        (Err(_), Ok(v_file)) => match fs::read_to_string(v_file) {
+            Ok(content) => Some(content.trim().to_string()),
+            Err(e) => panic!("Failed to load {}: {:?}", key, e)
+        },
+        _ => None
+    }
+}
+
 pub fn get_env<V>(key: &str) -> Option<V>
 where
     V: FromStr,
 {
-    try_parse_string(env::var(key))
+    try_parse_string(get_env_str_value(key))
+}
+
+const TRUE_VALUES: &[&str] = &["true", "t", "yes", "y", "1"];
+const FALSE_VALUES: &[&str] = &["false", "f", "no", "n", "0"];
+
+pub fn get_env_bool(key: &str) -> Option<bool> {
+    match get_env_str_value(key) {
+        Some(val) if TRUE_VALUES.contains(&val.to_lowercase().as_ref()) => Some(true),
+        Some(val) if FALSE_VALUES.contains(&val.to_lowercase().as_ref()) => Some(false),
+        _ => None,
+    }
 }
 
 //
@@ -271,7 +427,7 @@ fn _process_key(key: &str) -> String {
 // Retry methods
 //
 
-pub fn retry<F, T, E>(func: F, max_tries: i32) -> Result<T, E>
+pub fn retry<F, T, E>(func: F, max_tries: u32) -> Result<T, E>
 where
     F: Fn() -> Result<T, E>,
 {
@@ -289,6 +445,32 @@ where
                 }
 
                 sleep(Duration::from_millis(500));
+            }
+        }
+    }
+}
+
+pub fn retry_db<F, T, E>(func: F, max_tries: u32) -> Result<T, E>
+where
+    F: Fn() -> Result<T, E>,
+    E: std::error::Error,
+{
+    use std::{thread::sleep, time::Duration};
+    let mut tries = 0;
+
+    loop {
+        match func() {
+            ok @ Ok(_) => return ok,
+            Err(e) => {
+                tries += 1;
+
+                if tries >= max_tries && max_tries > 0 {
+                    return Err(e);
+                }
+
+                warn!("Can't connect to database, retrying: {:?}", e);
+
+                sleep(Duration::from_millis(1_000));
             }
         }
     }

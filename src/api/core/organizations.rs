@@ -1,16 +1,14 @@
-use rocket::request::Form;
-use rocket::Route;
+use num_traits::FromPrimitive;
+use rocket::{request::Form, Route};
 use rocket_contrib::json::Json;
 use serde_json::Value;
 
-use crate::api::{
-    EmptyResult, JsonResult, JsonUpcase, JsonUpcaseVec, Notify, NumberOrString, PasswordData, UpdateType,
+use crate::{
+    api::{EmptyResult, JsonResult, JsonUpcase, JsonUpcaseVec, Notify, NumberOrString, PasswordData, UpdateType},
+    auth::{decode_invite, AdminHeaders, Headers, OwnerHeaders, ManagerHeaders, ManagerHeadersLoose},
+    db::{models::*, DbConn},
+    mail, CONFIG,
 };
-use crate::auth::{decode_invite, AdminHeaders, Headers, OwnerHeaders};
-use crate::db::models::*;
-use crate::db::DbConn;
-use crate::mail;
-use crate::CONFIG;
 
 pub fn routes() -> Vec<Route> {
     routes![
@@ -45,6 +43,11 @@ pub fn routes() -> Vec<Route> {
         delete_user,
         post_delete_user,
         post_org_import,
+        list_policies,
+        list_policies_token,
+        get_policy,
+        put_policy,
+        get_plans,
     ]
 }
 
@@ -74,10 +77,14 @@ struct NewCollectionData {
 
 #[post("/organizations", data = "<data>")]
 fn create_organization(headers: Headers, data: JsonUpcase<OrgData>, conn: DbConn) -> JsonResult {
+    if !CONFIG.is_org_creation_allowed(&headers.user.email) {
+        err!("User not allowed to create organizations")
+    }
+
     let data: OrgData = data.into_inner().data;
 
     let org = Organization::new(data.Name, data.BillingEmail);
-    let mut user_org = UserOrganization::new(headers.user.uuid.clone(), org.uuid.clone());
+    let mut user_org = UserOrganization::new(headers.user.uuid, org.uuid.clone());
     let collection = Collection::new(org.uuid.clone(), data.CollectionName);
 
     user_org.akey = data.Key;
@@ -210,7 +217,7 @@ fn get_org_collections(org_id: String, _headers: AdminHeaders, conn: DbConn) -> 
 #[post("/organizations/<org_id>/collections", data = "<data>")]
 fn post_organization_collections(
     org_id: String,
-    _headers: AdminHeaders,
+    headers: ManagerHeadersLoose,
     data: JsonUpcase<NewCollectionData>,
     conn: DbConn,
 ) -> JsonResult {
@@ -221,8 +228,21 @@ fn post_organization_collections(
         None => err!("Can't find organization details"),
     };
 
-    let collection = Collection::new(org.uuid.clone(), data.Name);
+    // Get the user_organization record so that we can check if the user has access to all collections.
+    let user_org = match UserOrganization::find_by_user_and_org(&headers.user.uuid, &org_id, &conn) {
+        Some(u) => u,
+        None => err!("User is not part of organization"),
+    };
+
+    let collection = Collection::new(org.uuid, data.Name);
     collection.save(&conn)?;
+
+    // If the user doesn't have access to all collections, only in case of a Manger,
+    // then we need to save the creating user uuid (Manager) to the users_collection table.
+    // Else the user will not have access to his own created collection.
+    if !user_org.access_all {
+        CollectionUser::save(&headers.user.uuid, &collection.uuid, false, false, &conn)?;
+    }
 
     Ok(Json(collection.to_json()))
 }
@@ -231,7 +251,7 @@ fn post_organization_collections(
 fn put_organization_collection_update(
     org_id: String,
     col_id: String,
-    headers: AdminHeaders,
+    headers: ManagerHeaders,
     data: JsonUpcase<NewCollectionData>,
     conn: DbConn,
 ) -> JsonResult {
@@ -242,7 +262,7 @@ fn put_organization_collection_update(
 fn post_organization_collection_update(
     org_id: String,
     col_id: String,
-    _headers: AdminHeaders,
+    _headers: ManagerHeaders,
     data: JsonUpcase<NewCollectionData>,
     conn: DbConn,
 ) -> JsonResult {
@@ -262,7 +282,7 @@ fn post_organization_collection_update(
         err!("Collection is not owned by organization");
     }
 
-    collection.name = data.Name.clone();
+    collection.name = data.Name;
     collection.save(&conn)?;
 
     Ok(Json(collection.to_json()))
@@ -310,7 +330,7 @@ fn post_organization_collection_delete_user(
 }
 
 #[delete("/organizations/<org_id>/collections/<col_id>")]
-fn delete_organization_collection(org_id: String, col_id: String, _headers: AdminHeaders, conn: DbConn) -> EmptyResult {
+fn delete_organization_collection(org_id: String, col_id: String, _headers: ManagerHeaders, conn: DbConn) -> EmptyResult {
     match Collection::find_by_uuid(&col_id, &conn) {
         None => err!("Collection not found"),
         Some(collection) => {
@@ -334,7 +354,7 @@ struct DeleteCollectionData {
 fn post_organization_collection_delete(
     org_id: String,
     col_id: String,
-    headers: AdminHeaders,
+    headers: ManagerHeaders,
     _data: JsonUpcase<DeleteCollectionData>,
     conn: DbConn,
 ) -> EmptyResult {
@@ -342,7 +362,7 @@ fn post_organization_collection_delete(
 }
 
 #[get("/organizations/<org_id>/collections/<coll_id>/details")]
-fn get_org_collection_detail(org_id: String, coll_id: String, headers: AdminHeaders, conn: DbConn) -> JsonResult {
+fn get_org_collection_detail(org_id: String, coll_id: String, headers: ManagerHeaders, conn: DbConn) -> JsonResult {
     match Collection::find_by_uuid_and_user(&coll_id, &headers.user.uuid, &conn) {
         None => err!("Collection not found"),
         Some(collection) => {
@@ -356,7 +376,7 @@ fn get_org_collection_detail(org_id: String, coll_id: String, headers: AdminHead
 }
 
 #[get("/organizations/<org_id>/collections/<coll_id>/users")]
-fn get_collection_users(org_id: String, coll_id: String, _headers: AdminHeaders, conn: DbConn) -> JsonResult {
+fn get_collection_users(org_id: String, coll_id: String, _headers: ManagerHeaders, conn: DbConn) -> JsonResult {
     // Get org and collection, check that collection is from org
     let collection = match Collection::find_by_uuid_and_org(&coll_id, &org_id, &conn) {
         None => err!("Collection not found in Organization"),
@@ -369,7 +389,7 @@ fn get_collection_users(org_id: String, coll_id: String, _headers: AdminHeaders,
         .map(|col_user| {
             UserOrganization::find_by_user_and_org(&col_user.user_uuid, &org_id, &conn)
                 .unwrap()
-                .to_json_collection_user_details(col_user.read_only)
+                .to_json_user_access_restrictions(&col_user)
         })
         .collect();
 
@@ -381,7 +401,7 @@ fn put_collection_users(
     org_id: String,
     coll_id: String,
     data: JsonUpcaseVec<CollectionData>,
-    _headers: AdminHeaders,
+    _headers: ManagerHeaders,
     conn: DbConn,
 ) -> EmptyResult {
     // Get org and collection, check that collection is from org
@@ -403,7 +423,9 @@ fn put_collection_users(
             continue;
         }
 
-        CollectionUser::save(&user.user_uuid, &coll_id, d.ReadOnly, &conn)?;
+        CollectionUser::save(&user.user_uuid, &coll_id,
+                             d.ReadOnly, d.HidePasswords,
+                             &conn)?;
     }
 
     Ok(())
@@ -431,7 +453,7 @@ fn get_org_details(data: Form<OrgIdData>, headers: Headers, conn: DbConn) -> Jso
 }
 
 #[get("/organizations/<org_id>/users")]
-fn get_org_users(org_id: String, _headers: AdminHeaders, conn: DbConn) -> JsonResult {
+fn get_org_users(org_id: String, _headers: ManagerHeadersLoose, conn: DbConn) -> JsonResult {
     let users = UserOrganization::find_by_org(&org_id, &conn);
     let users_json: Vec<Value> = users.iter().map(|c| c.to_json_user_details(&conn)).collect();
 
@@ -447,6 +469,7 @@ fn get_org_users(org_id: String, _headers: AdminHeaders, conn: DbConn) -> JsonRe
 struct CollectionData {
     Id: String,
     ReadOnly: bool,
+    HidePasswords: bool,
 }
 
 #[derive(Deserialize)]
@@ -480,7 +503,11 @@ fn send_invite(org_id: String, data: JsonUpcase<InviteData>, headers: AdminHeade
         let user = match User::find_by_mail(&email, &conn) {
             None => {
                 if !CONFIG.invitations_allowed() {
-                    err!(format!("User email does not exist: {}", email))
+                    err!(format!("User does not exist: {}", email))
+                }
+
+                if !CONFIG.is_email_domain_allowed(&email) {
+                    err!("Email domain not eligible for invitations")
                 }
 
                 if !CONFIG.mail_enabled() {
@@ -514,7 +541,9 @@ fn send_invite(org_id: String, data: JsonUpcase<InviteData>, headers: AdminHeade
                 match Collection::find_by_uuid_and_org(&col.Id, &org_id, &conn) {
                     None => err!("Collection not found in Organization"),
                     Some(collection) => {
-                        CollectionUser::save(&user.uuid, &collection.uuid, col.ReadOnly, &conn)?;
+                        CollectionUser::save(&user.uuid, &collection.uuid,
+                                             col.ReadOnly, col.HidePasswords,
+                                             &conn)?;
                     }
                 }
             }
@@ -581,7 +610,7 @@ fn reinvite_user(org_id: String, user_org: String, headers: AdminHeaders, conn: 
             Some(headers.user.email),
         )?;
     } else {
-        let invitation = Invitation::new(user.email.clone());
+        let invitation = Invitation::new(user.email);
         invitation.save(&conn)?;
     }
 
@@ -769,7 +798,9 @@ fn edit_user(
             match Collection::find_by_uuid_and_org(&col.Id, &org_id, &conn) {
                 None => err!("Collection not found in Organization"),
                 Some(collection) => {
-                    CollectionUser::save(&user_to_edit.user_uuid, &collection.uuid, col.ReadOnly, &conn)?;
+                    CollectionUser::save(&user_to_edit.user_uuid, &collection.uuid,
+                                         col.ReadOnly, col.HidePasswords,
+                                         &conn)?;
                 }
             }
         }
@@ -830,21 +861,12 @@ struct RelationsData {
 fn post_org_import(
     query: Form<OrgIdData>,
     data: JsonUpcase<ImportData>,
-    headers: Headers,
+    headers: AdminHeaders,
     conn: DbConn,
     nt: Notify,
 ) -> EmptyResult {
     let data: ImportData = data.into_inner().data;
     let org_id = query.into_inner().organization_id;
-
-    let org_user = match UserOrganization::find_by_user_and_org(&headers.user.uuid, &org_id, &conn) {
-        Some(user) => user,
-        None => err!("User is not part of the organization"),
-    };
-
-    if org_user.atype < UserOrgType::Admin {
-        err!("Only admins or owners can import into an organization")
-    }
 
     // Read and create the collections
     let collections: Vec<_> = data
@@ -865,6 +887,8 @@ fn post_org_import(
     for relation in data.CollectionRelationships {
         relations.push((relation.Key, relation.Value));
     }
+
+    let headers: Headers = headers.into();
 
     // Read and create the ciphers
     let ciphers: Vec<_> = data
@@ -900,4 +924,136 @@ fn post_org_import(
 
     let mut user = headers.user;
     user.update_revision(&conn)
+}
+
+#[get("/organizations/<org_id>/policies")]
+fn list_policies(org_id: String, _headers: AdminHeaders, conn: DbConn) -> JsonResult {
+    let policies = OrgPolicy::find_by_org(&org_id, &conn);
+    let policies_json: Vec<Value> = policies.iter().map(OrgPolicy::to_json).collect();
+
+    Ok(Json(json!({
+        "Data": policies_json,
+        "Object": "list",
+        "ContinuationToken": null
+    })))
+}
+
+#[get("/organizations/<org_id>/policies/token?<token>")]
+fn list_policies_token(org_id: String, token: String, conn: DbConn) -> JsonResult {
+    let invite = crate::auth::decode_invite(&token)?;
+
+    let invite_org_id = match invite.org_id {
+        Some(invite_org_id) => invite_org_id,
+        None => err!("Invalid token"),
+    };
+
+    if invite_org_id != org_id {
+        err!("Token doesn't match request organization");
+    }
+
+    // TODO: We receive the invite token as ?token=<>, validate it contains the org id
+    let policies = OrgPolicy::find_by_org(&org_id, &conn);
+    let policies_json: Vec<Value> = policies.iter().map(OrgPolicy::to_json).collect();
+
+    Ok(Json(json!({
+        "Data": policies_json,
+        "Object": "list",
+        "ContinuationToken": null
+    })))
+}
+
+#[get("/organizations/<org_id>/policies/<pol_type>")]
+fn get_policy(org_id: String, pol_type: i32, _headers: AdminHeaders, conn: DbConn) -> JsonResult {
+    let pol_type_enum = match OrgPolicyType::from_i32(pol_type) {
+        Some(pt) => pt,
+        None => err!("Invalid policy type"),
+    };
+
+    let policy = match OrgPolicy::find_by_org_and_type(&org_id, pol_type, &conn) {
+        Some(p) => p,
+        None => OrgPolicy::new(org_id, pol_type_enum, "{}".to_string()),
+    };
+
+    Ok(Json(policy.to_json()))
+}
+
+#[derive(Deserialize)]
+struct PolicyData {
+    enabled: bool,
+    #[serde(rename = "type")]
+    _type: i32,
+    data: Value,
+}
+
+#[put("/organizations/<org_id>/policies/<pol_type>", data = "<data>")]
+fn put_policy(org_id: String, pol_type: i32, data: Json<PolicyData>, _headers: AdminHeaders, conn: DbConn) -> JsonResult {
+    let data: PolicyData = data.into_inner();
+
+    let pol_type_enum = match OrgPolicyType::from_i32(pol_type) {
+        Some(pt) => pt,
+        None => err!("Invalid policy type"),
+    };
+
+    let mut policy = match OrgPolicy::find_by_org_and_type(&org_id, pol_type, &conn) {
+        Some(p) => p,
+        None => OrgPolicy::new(org_id, pol_type_enum, "{}".to_string()),
+    };
+
+    policy.enabled = data.enabled;
+    policy.data = serde_json::to_string(&data.data)?;
+    policy.save(&conn)?;
+
+    Ok(Json(policy.to_json()))
+}
+
+#[get("/plans")]
+fn get_plans(_headers: Headers, _conn: DbConn) -> JsonResult {
+    Ok(Json(json!({
+        "Object": "list",
+        "Data": [
+        {
+            "Object": "plan",
+            "Type": 0,
+            "Product": 0,
+            "Name": "Free",
+            "IsAnnual": false,
+            "NameLocalizationKey": "planNameFree",
+            "DescriptionLocalizationKey": "planDescFree",
+            "CanBeUsedByBusiness": false,
+            "BaseSeats": 2,
+            "BaseStorageGb": null,
+            "MaxCollections": 2,
+            "MaxUsers": 2,
+            "HasAdditionalSeatsOption": false,
+            "MaxAdditionalSeats": null,
+            "HasAdditionalStorageOption": false,
+            "MaxAdditionalStorage": null,
+            "HasPremiumAccessOption": false,
+            "TrialPeriodDays": null,
+            "HasSelfHost": false,
+            "HasPolicies": false,
+            "HasGroups": false,
+            "HasDirectory": false,
+            "HasEvents": false,
+            "HasTotp": false,
+            "Has2fa": false,
+            "HasApi": false,
+            "HasSso": false,
+            "UsersGetPremium": false,
+            "UpgradeSortOrder": -1,
+            "DisplaySortOrder": -1,
+            "LegacyYear": null,
+            "Disabled": false,
+            "StripePlanId": null,
+            "StripeSeatPlanId": null,
+            "StripeStoragePlanId": null,
+            "StripePremiumAccessPlanId": null,
+            "BasePrice": 0.0,
+            "SeatPrice": 0.0,
+            "AdditionalStoragePricePerGb": 0.0,
+            "PremiumAccessOptionPrice": 0.0
+            }
+        ],
+        "ContinuationToken": null
+    })))
 }

@@ -1,6 +1,8 @@
-#![feature(proc_macro_hygiene, decl_macro, vec_remove_item, try_trait)]
+#![forbid(unsafe_code)]
+#![cfg_attr(feature = "unstable", feature(ip))]
 #![recursion_limit = "256"]
 
+extern crate openssl;
 #[macro_use]
 extern crate rocket;
 #[macro_use]
@@ -13,17 +15,17 @@ extern crate log;
 extern crate diesel;
 #[macro_use]
 extern crate diesel_migrations;
-#[macro_use]
-extern crate lazy_static;
-#[macro_use]
-extern crate derive_more;
-#[macro_use]
-extern crate num_derive;
 
 use std::{
+    fs::create_dir_all,
+    panic,
     path::Path,
     process::{exit, Command},
+    str::FromStr,
+    thread,
 };
+
+use structopt::StructOpt;
 
 #[macro_use]
 mod error;
@@ -31,6 +33,7 @@ mod api;
 mod auth;
 mod config;
 mod crypto;
+#[macro_use]
 mod db;
 mod mail;
 mod util;
@@ -38,60 +41,106 @@ mod util;
 pub use config::CONFIG;
 pub use error::{Error, MapResult};
 
+#[derive(Debug, StructOpt)]
+#[structopt(name = "bitwarden_rs", about = "A Bitwarden API server written in Rust")]
+struct Opt {
+    /// Prints the app version
+    #[structopt(short, long)]
+    version: bool,
+}
+
 fn main() {
+    parse_args();
     launch_info();
 
-    if CONFIG.extended_logging() {
-        init_logging().ok();
-    }
+    use log::LevelFilter as LF;
+    let level = LF::from_str(&CONFIG.log_level()).expect("Valid log level");
+    init_logging(level).ok();
 
-    #[cfg(all(feature = "sqlite", feature = "mysql"))]
-    compile_error!("Can't enable both backends");
+    let extra_debug = match level {
+        LF::Trace | LF::Debug => true,
+        _ => false,
+    };
 
-    #[cfg(not(any(feature = "sqlite", feature = "mysql")))]
-    compile_error!("You need to enable one DB backend. To build with previous defaults do: cargo build --features sqlite");
-
-    check_db();
     check_rsa_keys();
     check_web_vault();
-    migrations::run_migrations();
 
-    launch_rocket();
+    create_icon_cache_folder();
+
+    launch_rocket(extra_debug);
+}
+
+fn parse_args() {
+    let opt = Opt::from_args();
+    if opt.version {
+        if let Some(version) = option_env!("BWRS_VERSION") {
+            println!("bitwarden_rs {}", version);
+        } else {
+            println!("bitwarden_rs (Version info from Git not present)");
+        }
+        exit(0);
+    }
 }
 
 fn launch_info() {
     println!("/--------------------------------------------------------------------\\");
     println!("|                       Starting Bitwarden_RS                        |");
 
-    if let Some(version) = option_env!("GIT_VERSION") {
+    if let Some(version) = option_env!("BWRS_VERSION") {
         println!("|{:^68}|", format!("Version {}", version));
     }
 
     println!("|--------------------------------------------------------------------|");
     println!("| This is an *unofficial* Bitwarden implementation, DO NOT use the   |");
     println!("| official channels to report bugs/features, regardless of client.   |");
-    println!("| Report URL: https://github.com/dani-garcia/bitwarden_rs/issues/new |");
+    println!("| Send usage/configuration questions or feature requests to:         |");
+    println!("|   https://bitwardenrs.discourse.group/                             |");
+    println!("| Report suspected bugs/issues in the software itself at:            |");
+    println!("|   https://github.com/dani-garcia/bitwarden_rs/issues/new           |");
     println!("\\--------------------------------------------------------------------/\n");
 }
 
-fn init_logging() -> Result<(), fern::InitError> {
-    use std::str::FromStr;
+fn init_logging(level: log::LevelFilter) -> Result<(), fern::InitError> {
     let mut logger = fern::Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "{}[{}][{}] {}",
-                chrono::Local::now().format("[%Y-%m-%d %H:%M:%S]"),
-                record.target(),
-                record.level(),
-                message
-            ))
-        })
-        .level(log::LevelFilter::from_str(&CONFIG.log_level()).expect("Valid log level"))
+        .level(level)
         // Hide unknown certificate errors if using self-signed
         .level_for("rustls::session", log::LevelFilter::Off)
         // Hide failed to close stream messages
         .level_for("hyper::server", log::LevelFilter::Warn)
+        // Silence rocket logs
+        .level_for("_", log::LevelFilter::Off)
+        .level_for("launch", log::LevelFilter::Off)
+        .level_for("launch_", log::LevelFilter::Off)
+        .level_for("rocket::rocket", log::LevelFilter::Off)
+        .level_for("rocket::fairing", log::LevelFilter::Off)
+        // Never show html5ever and hyper::proto logs, too noisy
+        .level_for("html5ever", log::LevelFilter::Off)
+        .level_for("hyper::proto", log::LevelFilter::Off)
         .chain(std::io::stdout());
+
+    // Enable smtp debug logging only specifically for smtp when need.
+    // This can contain sensitive information we do not want in the default debug/trace logging.
+    if CONFIG.smtp_debug() {
+        println!("[WARNING] SMTP Debugging is enabled (SMTP_DEBUG=true). Sensitive information could be disclosed via logs!");
+        println!("[WARNING] Only enable SMTP_DEBUG during troubleshooting!\n");
+        logger = logger.level_for("lettre::transport::smtp", log::LevelFilter::Debug)
+    } else {
+        logger = logger.level_for("lettre::transport::smtp", log::LevelFilter::Off)
+    }
+
+    if CONFIG.extended_logging() {
+        logger = logger.format(|out, message, record| {
+            out.finish(format_args!(
+                "[{}][{}][{}] {}",
+                chrono::Local::now().format(&CONFIG.log_timestamp_format()),
+                record.target(),
+                record.level(),
+                message
+            ))
+        });
+    } else {
+        logger = logger.format(|out, message, _| out.finish(format_args!("{}", message)));
+    }
 
     if let Some(log_file) = CONFIG.log_file() {
         logger = logger.chain(fern::log_file(log_file)?);
@@ -105,6 +154,42 @@ fn init_logging() -> Result<(), fern::InitError> {
     }
 
     logger.apply()?;
+
+    // Catch panics and log them instead of default output to StdErr
+    panic::set_hook(Box::new(|info| {
+        let thread = thread::current();
+        let thread = thread.name().unwrap_or("unnamed");
+
+        let msg = match info.payload().downcast_ref::<&'static str>() {
+            Some(s) => *s,
+            None => match info.payload().downcast_ref::<String>() {
+                Some(s) => &**s,
+                None => "Box<Any>",
+            },
+        };
+
+        let backtrace = backtrace::Backtrace::new();
+
+        match info.location() {
+            Some(location) => {
+                error!(
+                    target: "panic", "thread '{}' panicked at '{}': {}:{}\n{:?}",
+                    thread,
+                    msg,
+                    location.file(),
+                    location.line(),
+                    backtrace
+                );
+            }
+            None => error!(
+                target: "panic",
+                "thread '{}' panicked at '{}'\n{:?}",
+                thread,
+                msg,
+                backtrace
+            ),
+        }
+    }));
 
     Ok(())
 }
@@ -127,29 +212,9 @@ fn chain_syslog(logger: fern::Dispatch) -> fern::Dispatch {
     }
 }
 
-fn check_db() {
-    if cfg!(feature = "sqlite") {
-        let url = CONFIG.database_url();
-        let path = Path::new(&url);
-
-        if let Some(parent) = path.parent() {
-            use std::fs;
-            if fs::create_dir_all(parent).is_err() {
-                error!("Error creating database directory");
-                exit(1);
-            }
-        }
-
-        // Turn on WAL in SQLite
-        if CONFIG.enable_db_wal() {
-            use diesel::RunQueryDsl;
-            let connection = db::get_connection().expect("Can't conect to DB");
-            diesel::sql_query("PRAGMA journal_mode=wal")
-                .execute(&connection)
-                .expect("Failed to turn on WAL");
-        }
-    }
-    db::get_connection().expect("Can't connect to DB");
+fn create_icon_cache_folder() {
+    // Try to create the icon cache folder, and generate an error if it could not.
+    create_dir_all(&CONFIG.icon_cache_folder()).expect("Error creating icon cache directory");
 }
 
 fn check_rsa_keys() {
@@ -158,7 +223,9 @@ fn check_rsa_keys() {
         info!("JWT keys don't exist, checking if OpenSSL is available...");
 
         Command::new("openssl").arg("version").status().unwrap_or_else(|_| {
-            info!("Can't create keys because OpenSSL is not available, make sure it's installed and available on the PATH");
+            info!(
+                "Can't create keys because OpenSSL is not available, make sure it's installed and available on the PATH"
+            );
             exit(1);
         });
 
@@ -206,59 +273,41 @@ fn check_web_vault() {
     let index_path = Path::new(&CONFIG.web_vault_folder()).join("index.html");
 
     if !index_path.exists() {
-        error!("Web vault is not found. To install it, please follow the steps in https://github.com/dani-garcia/bitwarden_rs/wiki/Building-binary#install-the-web-vault");
+        error!("Web vault is not found at '{}'. To install it, please follow the steps in: ", CONFIG.web_vault_folder());
+        error!("https://github.com/dani-garcia/bitwarden_rs/wiki/Building-binary#install-the-web-vault");
+        error!("You can also set the environment variable 'WEB_VAULT_ENABLED=false' to disable it");
         exit(1);
     }
 }
 
-// Embed the migrations from the migrations folder into the application
-// This way, the program automatically migrates the database to the latest version
-// https://docs.rs/diesel_migrations/*/diesel_migrations/macro.embed_migrations.html
-#[allow(unused_imports)]
-mod migrations {
+fn launch_rocket(extra_debug: bool) {
+    let pool = match util::retry_db(db::DbPool::from_config, CONFIG.db_connection_retries()) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Error creating database pool: {:?}", e);
+            exit(1);
+        }
+    };
 
-    #[cfg(feature = "sqlite")]
-    embed_migrations!("migrations/sqlite");
-    #[cfg(feature = "mysql")]
-    embed_migrations!("migrations/mysql");
+    let basepath = &CONFIG.domain_path();
 
-    pub fn run_migrations() {
-        // Make sure the database is up to date (create if it doesn't exist, or run the migrations)
-        let connection = crate::db::get_connection().expect("Can't connect to DB");
-
-        use std::io::stdout;
-        embedded_migrations::run_with_output(&connection, &mut stdout()).expect("Can't run migrations");
-    }
-}
-
-fn launch_rocket() {
-    // Create Rocket object, this stores current log level and sets it's own
-    let rocket = rocket::ignite();
-
-    // If we aren't logging the mounts, we force the logging level down
-    if !CONFIG.log_mounts() {
-        log::set_max_level(log::LevelFilter::Warn);
-    }
-
-    let rocket = rocket
-        .mount("/", api::web_routes())
-        .mount("/api", api::core_routes())
-        .mount("/admin", api::admin_routes())
-        .mount("/identity", api::identity_routes())
-        .mount("/icons", api::icons_routes())
-        .mount("/notifications", api::notifications_routes());
-
-    // Force the level up for the fairings, managed state and lauch
-    if !CONFIG.log_mounts() {
-        log::set_max_level(log::LevelFilter::max());
-    }
-
-    let rocket = rocket
-        .manage(db::init_pool())
+    // If adding more paths here, consider also adding them to
+    // crate::utils::LOGGED_ROUTES to make sure they appear in the log
+    let result = rocket::ignite()
+        .mount(&[basepath, "/"].concat(), api::web_routes())
+        .mount(&[basepath, "/api"].concat(), api::core_routes())
+        .mount(&[basepath, "/admin"].concat(), api::admin_routes())
+        .mount(&[basepath, "/identity"].concat(), api::identity_routes())
+        .mount(&[basepath, "/icons"].concat(), api::icons_routes())
+        .mount(&[basepath, "/notifications"].concat(), api::notifications_routes())
+        .manage(pool)
         .manage(api::start_notification_server())
-        .attach(util::AppHeaders());
+        .attach(util::AppHeaders())
+        .attach(util::CORS())
+        .attach(util::BetterLogging(extra_debug))
+        .launch();
 
     // Launch and print error if there is one
     // The launch will restore the original logging level
-    error!("Launch error {:#?}", rocket.launch());
+    error!("Launch error {:#?}", result);
 }

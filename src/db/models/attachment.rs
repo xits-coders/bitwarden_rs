@@ -3,21 +3,24 @@ use serde_json::Value;
 use super::Cipher;
 use crate::CONFIG;
 
-#[derive(Debug, Identifiable, Queryable, Insertable, Associations)]
-#[table_name = "attachments"]
-#[belongs_to(Cipher, foreign_key = "cipher_uuid")]
-#[primary_key(id)]
-pub struct Attachment {
-    pub id: String,
-    pub cipher_uuid: String,
-    pub file_name: String,
-    pub file_size: i32,
-    pub akey: Option<String>,
+db_object! {
+    #[derive(Debug, Identifiable, Queryable, Insertable, Associations, AsChangeset)]
+    #[table_name = "attachments"]
+    #[changeset_options(treat_none_as_null="true")]
+    #[belongs_to(super::Cipher, foreign_key = "cipher_uuid")]
+    #[primary_key(id)]
+    pub struct Attachment {
+        pub id: String,
+        pub cipher_uuid: String,
+        pub file_name: String,
+        pub file_size: i32,
+        pub akey: Option<String>,
+    }
 }
 
 /// Local methods
 impl Attachment {
-    pub fn new(id: String, cipher_uuid: String, file_name: String, file_size: i32) -> Self {
+    pub const fn new(id: String, cipher_uuid: String, file_name: String, file_size: i32) -> Self {
         Self {
             id,
             cipher_uuid,
@@ -49,32 +52,57 @@ impl Attachment {
     }
 }
 
-use crate::db::schema::attachments;
 use crate::db::DbConn;
-use diesel;
-use diesel::prelude::*;
 
 use crate::api::EmptyResult;
 use crate::error::MapResult;
 
 /// Database methods
 impl Attachment {
+
     pub fn save(&self, conn: &DbConn) -> EmptyResult {
-        diesel::replace_into(attachments::table)
-            .values(self)
-            .execute(&**conn)
-            .map_res("Error saving attachment")
+        db_run! { conn:
+            sqlite, mysql {
+                match diesel::replace_into(attachments::table)
+                    .values(AttachmentDb::to_db(self))
+                    .execute(conn)
+                {
+                    Ok(_) => Ok(()),
+                    // Record already exists and causes a Foreign Key Violation because replace_into() wants to delete the record first.
+                    Err(diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::ForeignKeyViolation, _)) => {
+                        diesel::update(attachments::table)
+                            .filter(attachments::id.eq(&self.id))
+                            .set(AttachmentDb::to_db(self))
+                            .execute(conn)
+                            .map_res("Error saving attachment")
+                    }
+                    Err(e) => Err(e.into()),
+                }.map_res("Error saving attachment")
+            }
+            postgresql {
+                let value = AttachmentDb::to_db(self);
+                diesel::insert_into(attachments::table)
+                    .values(&value)
+                    .on_conflict(attachments::id)
+                    .do_update()
+                    .set(&value)
+                    .execute(conn)
+                    .map_res("Error saving attachment")
+            }
+        }
     }
 
     pub fn delete(self, conn: &DbConn) -> EmptyResult {
-        crate::util::retry(
-            || diesel::delete(attachments::table.filter(attachments::id.eq(&self.id))).execute(&**conn),
-            10,
-        )
-        .map_res("Error deleting attachment")?;
+        db_run! { conn: {
+            crate::util::retry(
+                || diesel::delete(attachments::table.filter(attachments::id.eq(&self.id))).execute(conn),
+                10,
+            )
+            .map_res("Error deleting attachment")?;
 
-        crate::util::delete_file(&self.get_file_path())?;
-        Ok(())
+            crate::util::delete_file(&self.get_file_path())?;
+            Ok(())
+        }}
     }
 
     pub fn delete_all_by_cipher(cipher_uuid: &str, conn: &DbConn) -> EmptyResult {
@@ -85,25 +113,78 @@ impl Attachment {
     }
 
     pub fn find_by_id(id: &str, conn: &DbConn) -> Option<Self> {
-        let id = id.to_lowercase();
-
-        attachments::table
-            .filter(attachments::id.eq(id))
-            .first::<Self>(&**conn)
-            .ok()
+        db_run! { conn: {
+            attachments::table
+                .filter(attachments::id.eq(id.to_lowercase()))
+                .first::<AttachmentDb>(conn)
+                .ok()
+                .from_db()
+        }}
     }
 
     pub fn find_by_cipher(cipher_uuid: &str, conn: &DbConn) -> Vec<Self> {
-        attachments::table
-            .filter(attachments::cipher_uuid.eq(cipher_uuid))
-            .load::<Self>(&**conn)
-            .expect("Error loading attachments")
+        db_run! { conn: {
+            attachments::table
+                .filter(attachments::cipher_uuid.eq(cipher_uuid))
+                .load::<AttachmentDb>(conn)
+                .expect("Error loading attachments")
+                .from_db()
+        }}
     }
 
     pub fn find_by_ciphers(cipher_uuids: Vec<String>, conn: &DbConn) -> Vec<Self> {
-        attachments::table
-            .filter(attachments::cipher_uuid.eq_any(cipher_uuids))
-            .load::<Self>(&**conn)
-            .expect("Error loading attachments")
+        db_run! { conn: {
+            attachments::table
+                .filter(attachments::cipher_uuid.eq_any(cipher_uuids))
+                .load::<AttachmentDb>(conn)
+                .expect("Error loading attachments")
+                .from_db()
+        }}
+    }
+
+    pub fn size_by_user(user_uuid: &str, conn: &DbConn) -> i64 {
+        db_run! { conn: {
+            let result: Option<i64> = attachments::table
+                .left_join(ciphers::table.on(ciphers::uuid.eq(attachments::cipher_uuid)))
+                .filter(ciphers::user_uuid.eq(user_uuid))
+                .select(diesel::dsl::sum(attachments::file_size))
+                .first(conn)
+                .expect("Error loading user attachment total size");
+            result.unwrap_or(0)
+        }}
+    }
+
+    pub fn count_by_user(user_uuid: &str, conn: &DbConn) -> i64 {
+        db_run! { conn: {
+            attachments::table
+                .left_join(ciphers::table.on(ciphers::uuid.eq(attachments::cipher_uuid)))
+                .filter(ciphers::user_uuid.eq(user_uuid))
+                .count()
+                .first(conn)
+                .unwrap_or(0)
+        }}
+    }
+
+    pub fn size_by_org(org_uuid: &str, conn: &DbConn) -> i64 {
+        db_run! { conn: {
+            let result: Option<i64> = attachments::table
+                .left_join(ciphers::table.on(ciphers::uuid.eq(attachments::cipher_uuid)))
+                .filter(ciphers::organization_uuid.eq(org_uuid))
+                .select(diesel::dsl::sum(attachments::file_size))
+                .first(conn)
+                .expect("Error loading user attachment total size");
+            result.unwrap_or(0)
+        }}
+    }
+
+    pub fn count_by_org(org_uuid: &str, conn: &DbConn) -> i64 {
+        db_run! { conn: {
+            attachments::table
+                .left_join(ciphers::table.on(ciphers::uuid.eq(attachments::cipher_uuid)))
+                .filter(ciphers::organization_uuid.eq(org_uuid))
+                .count()
+                .first(conn)
+                .unwrap_or(0)
+        }}
     }
 }

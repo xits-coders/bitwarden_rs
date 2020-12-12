@@ -1,25 +1,22 @@
 pool:
-  vmImage: 'Ubuntu-16.04'
+  vmImage: 'Ubuntu-18.04'
 
 steps:
 - script: |
     ls -la
-    curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain $(cat rust-toolchain)
+    curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain $(cat rust-toolchain) --profile=minimal
     echo "##vso[task.prependpath]$HOME/.cargo/bin"
   displayName: 'Install Rust'
 
 - script: |
     sudo apt-get update
-    sudo apt-get install -y libmysql++-dev
-  displayName: Install libmysql
+    sudo apt-get install -y --no-install-recommends build-essential libmariadb-dev-compat libpq-dev libssl-dev pkgconf
+  displayName: 'Install build libraries.'
 
 - script: |
     rustc -Vv
     cargo -V
   displayName: Query rust and cargo versions
 
-- script : cargo build --features "sqlite"
-  displayName: 'Build project with sqlite backend'
-
-- script : cargo build --features "mysql"
-  displayName: 'Build project with mysql backend'
+- script : cargo test --features "sqlite,mysql,postgresql"
+  displayName: 'Test project with sqlite, mysql and postgresql backends'

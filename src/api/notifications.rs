@@ -1,20 +1,34 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use rocket::Route;
 use rocket_contrib::json::Json;
 use serde_json::Value as JsonValue;
 
-use crate::api::JsonResult;
-use crate::auth::Headers;
-use crate::db::DbConn;
-
-use crate::CONFIG;
+use crate::{
+    api::{EmptyResult, JsonResult},
+    auth::Headers,
+    db::DbConn,
+    Error, CONFIG,
+};
 
 pub fn routes() -> Vec<Route> {
     routes![negotiate, websockets_err]
 }
 
+static SHOW_WEBSOCKETS_MSG: AtomicBool = AtomicBool::new(true);
+
 #[get("/hub")]
-fn websockets_err() -> JsonResult {
-    err!("'/notifications/hub' should be proxied to the websocket server or notifications won't work. Go to the README for more info.")
+fn websockets_err() -> EmptyResult {
+    if CONFIG.websocket_enabled() && SHOW_WEBSOCKETS_MSG.compare_and_swap(true, false, Ordering::Relaxed) {
+        err!(
+    "###########################################################
+    '/notifications/hub' should be proxied to the websocket server or notifications won't work.
+    Go to the Wiki for more info, or disable WebSockets setting WEBSOCKET_ENABLED=false.
+    ###########################################################################################"
+        )
+    } else {
+        Err(Error::empty())
+    }
 }
 
 #[post("/hub/negotiate")]
@@ -43,10 +57,11 @@ fn negotiate(_headers: Headers, _conn: DbConn) -> JsonResult {
 //
 // Websockets server
 //
+use std::io;
 use std::sync::Arc;
 use std::thread;
 
-use ws::{self, util::Token, Factory, Handler, Handshake, Message, Sender, WebSocket};
+use ws::{self, util::Token, Factory, Handler, Handshake, Message, Sender};
 
 use chashmap::CHashMap;
 use chrono::NaiveDateTime;
@@ -124,20 +139,62 @@ struct InitialMessage {
 const PING_MS: u64 = 15_000;
 const PING: Token = Token(1);
 
+const ACCESS_TOKEN_KEY: &str = "access_token=";
+
+impl WSHandler {
+    fn err(&self, msg: &'static str) -> ws::Result<()> {
+        self.out.close(ws::CloseCode::Invalid)?;
+
+        // We need to specifically return an IO error so ws closes the connection
+        let io_error = io::Error::from(io::ErrorKind::InvalidData);
+        Err(ws::Error::new(ws::ErrorKind::Io(io_error), msg))
+    }
+
+    fn get_request_token(&self, hs: Handshake) -> Option<String> {
+        use std::str::from_utf8;
+
+        // Verify we have a token header
+        if let Some(header_value) = hs.request.header("Authorization") {
+            if let Ok(converted) = from_utf8(header_value) {
+                if let Some(token_part) = converted.split("Bearer ").nth(1) {
+                    return Some(token_part.into());
+                }
+            }
+        };
+        
+        // Otherwise verify the query parameter value
+        let path = hs.request.resource();
+        if let Some(params) = path.split('?').nth(1) {
+            let params_iter = params.split('&').take(1);
+            for val in params_iter {
+                if val.starts_with(ACCESS_TOKEN_KEY) {
+                    return Some(val[ACCESS_TOKEN_KEY.len()..].into());
+                }
+            }
+        };
+
+        None
+    }
+}
+
 impl Handler for WSHandler {
     fn on_open(&mut self, hs: Handshake) -> ws::Result<()> {
-        // TODO: Improve this split
-        let path = hs.request.resource();
-        let mut query_split: Vec<_> = path.split('?').nth(1).unwrap().split('&').collect();
-        query_split.sort();
-        let access_token = &query_split[0][13..];
-        let _id = &query_split[1][3..];
+        // Path == "/notifications/hub?id=<id>==&access_token=<access_token>"
+        //
+        // We don't use `id`, and as of around 2020-03-25, the official clients
+        // no longer seem to pass `id` (only `access_token`).
+
+        // Get user token from header or query parameter
+        let access_token = match self.get_request_token(hs) {
+            Some(token) => token,
+            _ => return self.err("Missing access token"),
+        };
 
         // Validate the user
         use crate::auth;
-        let claims = match auth::decode_login(access_token) {
+        let claims = match auth::decode_login(access_token.as_str()) {
             Ok(claims) => claims,
-            Err(_) => return Err(ws::Error::new(ws::ErrorKind::Internal, "Invalid access token provided")),
+            Err(_) => return self.err("Invalid access token provided"),
         };
 
         // Assign the user to the handler
@@ -157,8 +214,6 @@ impl Handler for WSHandler {
     }
 
     fn on_message(&mut self, msg: Message) -> ws::Result<()> {
-        info!("Server got message '{}'. ", msg);
-
         if let Message::Text(text) = msg.clone() {
             let json = &text[..text.len() - 1]; // Remove last char
 
@@ -181,10 +236,7 @@ impl Handler for WSHandler {
             // reschedule the timeout
             self.out.timeout(PING_MS, PING)
         } else {
-            Err(ws::Error::new(
-                ws::ErrorKind::Internal,
-                "Invalid timeout token provided",
-            ))
+            Ok(())
         }
     }
 }
@@ -218,7 +270,9 @@ impl Factory for WSFactory {
         // Remove handler
         if let Some(user_uuid) = &handler.user_uuid {
             if let Some(mut user_conn) = self.users.map.get_mut(user_uuid) {
-                user_conn.remove_item(&handler.out);
+                if let Some(pos) = user_conn.iter().position(|x| x == &handler.out) {
+                    user_conn.remove(pos);
+                }
             }
         }
     }
@@ -289,7 +343,7 @@ impl WebSocketUsers {
 /* Message Structure
 [
     1, // MessageType.Invocation
-    {}, // Headers
+    {}, // Headers (map)
     null, // InvocationId
     "ReceiveMessage", // Target
     [ // Arguments
@@ -306,7 +360,7 @@ fn create_update(payload: Vec<(Value, Value)>, ut: UpdateType) -> Vec<u8> {
 
     let value = V::Array(vec![
         1.into(),
-        V::Array(vec![]),
+        V::Map(vec![]),
         V::Nil,
         "ReceiveMessage".into(),
         V::Array(vec![V::Map(vec![
@@ -353,7 +407,14 @@ pub fn start_notification_server() -> WebSocketUsers {
 
     if CONFIG.websocket_enabled() {
         thread::spawn(move || {
-            WebSocket::new(factory)
+            let mut settings = ws::Settings::default();
+            settings.max_connections = 500;
+            settings.queue_size = 2;
+            settings.panic_on_internal = false;
+
+            ws::Builder::new()
+                .with_settings(settings)
+                .build(factory)
                 .unwrap()
                 .listen((CONFIG.websocket_address().as_str(), CONFIG.websocket_port()))
                 .unwrap();

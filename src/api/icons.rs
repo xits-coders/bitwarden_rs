@@ -1,48 +1,77 @@
-use std::fs::{create_dir_all, remove_file, symlink_metadata, File};
-use std::io::prelude::*;
-use std::time::{Duration, SystemTime};
+use std::{
+    collections::HashMap,
+    fs::{create_dir_all, remove_file, symlink_metadata, File},
+    io::prelude::*,
+    net::{IpAddr, ToSocketAddrs},
+    sync::RwLock,
+    time::{Duration, SystemTime},
+};
 
-use rocket::http::ContentType;
-use rocket::response::Content;
-use rocket::Route;
-
-use reqwest::{header::HeaderMap, Client, Response};
-
-use rocket::http::Cookie;
-
+use once_cell::sync::Lazy;
 use regex::Regex;
+use reqwest::{blocking::Client, blocking::Response, header::HeaderMap, Url};
+use rocket::{http::ContentType, http::Cookie, response::Content, Route};
 use soup::prelude::*;
 
-use crate::error::Error;
-use crate::CONFIG;
+use crate::{error::Error, util::Cached, CONFIG};
 
 pub fn routes() -> Vec<Route> {
     routes![icon]
 }
 
-const FALLBACK_ICON: &[u8; 344] = include_bytes!("../static/fallback-icon.png");
-
 const ALLOWED_CHARS: &str = "_-.";
 
-lazy_static! {
+static CLIENT: Lazy<Client> = Lazy::new(|| {
     // Reuse the client between requests
-    static ref CLIENT: Client = Client::builder()
-        .gzip(true)
+    Client::builder()
         .timeout(Duration::from_secs(CONFIG.icon_download_timeout()))
         .default_headers(_header_map())
         .build()
-        .unwrap();
+        .unwrap()
+});
+
+// Build Regex only once since this takes a lot of time.
+static ICON_REL_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)icon$|apple.*icon").unwrap());
+static ICON_SIZE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?x)(\d+)\D*(\d+)").unwrap());
+
+// Special HashMap which holds the user defined Regex to speedup matching the regex.
+static ICON_BLACKLIST_REGEX: Lazy<RwLock<HashMap<String, Regex>>> = Lazy::new(|| RwLock::new(HashMap::new()));
+
+#[get("/<domain>/icon.png")]
+fn icon(domain: String) -> Option<Cached<Content<Vec<u8>>>> {
+    if !is_valid_domain(&domain) {
+        warn!("Invalid domain: {}", domain);
+        return None;
+    }
+
+    get_icon(&domain).map(|icon| Cached::long(Content(ContentType::new("image", "x-icon"), icon)))
 }
 
+/// Returns if the domain provided is valid or not.
+///
+/// This does some manual checks and makes use of Url to do some basic checking.
+/// domains can't be larger then 63 characters (not counting multiple subdomains) according to the RFC's, but we limit the total size to 255.
 fn is_valid_domain(domain: &str) -> bool {
-    // Don't allow empty or too big domains or path traversal
-    if domain.is_empty() || domain.len() > 255 || domain.contains("..") {
+    // If parsing the domain fails using Url, it will not work with reqwest.
+    if let Err(parse_error) = Url::parse(format!("https://{}", domain).as_str()) {
+        debug!("Domain parse error: '{}' - {:?}", domain, parse_error);
+        return false;
+    } else if domain.is_empty()
+        || domain.contains("..")
+        || domain.starts_with('.')
+        || domain.starts_with('-')
+        || domain.ends_with('-')
+    {
+        debug!("Domain validation error: '{}' is either empty, contains '..', starts with an '.', starts or ends with a '-'", domain);
+        return false;
+    } else if domain.len() > 255 {
+        debug!("Domain validation error: '{}' exceeds 255 characters", domain);
         return false;
     }
 
-    // Only alphanumeric or specific characters
     for c in domain.chars() {
         if !c.is_alphanumeric() && !ALLOWED_CHARS.contains(c) {
+            debug!("Domain validation error: '{}' contains an invalid character '{}'", domain, c);
             return false;
         }
     }
@@ -50,62 +79,190 @@ fn is_valid_domain(domain: &str) -> bool {
     true
 }
 
-#[get("/<domain>/icon.png")]
-fn icon(domain: String) -> Content<Vec<u8>> {
-    let icon_type = ContentType::new("image", "x-icon");
-
-    if !is_valid_domain(&domain) {
-        warn!("Invalid domain: {:#?}", domain);
-        return Content(icon_type, FALLBACK_ICON.to_vec());
+/// TODO: This is extracted from IpAddr::is_global, which is unstable:
+/// https://doc.rust-lang.org/nightly/std/net/enum.IpAddr.html#method.is_global
+/// Remove once https://github.com/rust-lang/rust/issues/27709 is merged
+#[allow(clippy::nonminimal_bool)]
+#[cfg(not(feature = "unstable"))]
+fn is_global(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            // check if this address is 192.0.0.9 or 192.0.0.10. These addresses are the only two
+            // globally routable addresses in the 192.0.0.0/24 range.
+            if u32::from(ip) == 0xc0000009 || u32::from(ip) == 0xc000000a {
+                return true;
+            }
+            !ip.is_private()
+            && !ip.is_loopback()
+            && !ip.is_link_local()
+            && !ip.is_broadcast()
+            && !ip.is_documentation()
+            && !(ip.octets()[0] == 100 && (ip.octets()[1] & 0b1100_0000 == 0b0100_0000))
+            && !(ip.octets()[0] == 192 && ip.octets()[1] == 0 && ip.octets()[2] == 0)
+            && !(ip.octets()[0] & 240 == 240 && !ip.is_broadcast())
+            && !(ip.octets()[0] == 198 && (ip.octets()[1] & 0xfe) == 18)
+            // Make sure the address is not in 0.0.0.0/8
+            && ip.octets()[0] != 0
+        }
+        IpAddr::V6(ip) => {
+            if ip.is_multicast() && ip.segments()[0] & 0x000f == 14 {
+                true
+            } else {
+                !ip.is_multicast()
+                    && !ip.is_loopback()
+                    && !((ip.segments()[0] & 0xffc0) == 0xfe80)
+                    && !((ip.segments()[0] & 0xfe00) == 0xfc00)
+                    && !ip.is_unspecified()
+                    && !((ip.segments()[0] == 0x2001) && (ip.segments()[1] == 0xdb8))
+            }
+        }
     }
+}
 
-    if let Some(blacklist) = CONFIG.icon_blacklist_regex() {
-        info!("Icon blacklist enabled: {:#?}", blacklist);
+#[cfg(feature = "unstable")]
+fn is_global(ip: IpAddr) -> bool {
+    ip.is_global()
+}
 
-        let regex = Regex::new(&blacklist).expect("Valid Regex");
+/// These are some tests to check that the implementations match
+/// The IPv4 can be all checked in 5 mins or so and they are correct as of nightly 2020-07-11
+/// The IPV6 can't be checked in a reasonable time, so we check  about ten billion random ones, so far correct
+/// Note that the is_global implementation is subject to change as new IP RFCs are created
+///
+/// To run while showing progress output:
+/// cargo test --features sqlite,unstable -- --nocapture --ignored
+#[cfg(test)]
+#[cfg(feature = "unstable")]
+mod tests {
+    use super::*;
 
-        if regex.is_match(&domain) {
-            warn!("Blacklisted domain: {:#?}", domain);
-            return Content(icon_type, FALLBACK_ICON.to_vec());
+    #[test]
+    #[ignore]
+    fn test_ipv4_global() {
+        for a in 0..u8::MAX {
+            println!("Iter: {}/255", a);
+            for b in 0..u8::MAX {
+                for c in 0..u8::MAX {
+                    for d in 0..u8::MAX {
+                        let ip = IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d));
+                        assert_eq!(ip.is_global(), is_global(ip))
+                    }
+                }
+            }
         }
     }
 
-    let icon = get_icon(&domain);
-
-    Content(icon_type, icon)
+    #[test]
+    #[ignore]
+    fn test_ipv6_global() {
+        use ring::rand::{SecureRandom, SystemRandom};
+        let mut v = [0u8; 16];
+        let rand = SystemRandom::new();
+        for i in 0..1_000 {
+            println!("Iter: {}/1_000", i);
+            for _ in 0..10_000_000 {
+                rand.fill(&mut v).expect("Error generating random values");
+                let ip = IpAddr::V6(std::net::Ipv6Addr::new(
+                    (v[14] as u16) << 8 | v[15] as u16,
+                    (v[12] as u16) << 8 | v[13] as u16,
+                    (v[10] as u16) << 8 | v[11] as u16,
+                    (v[8] as u16) << 8 | v[9] as u16,
+                    (v[6] as u16) << 8 | v[7] as u16,
+                    (v[4] as u16) << 8 | v[5] as u16,
+                    (v[2] as u16) << 8 | v[3] as u16,
+                    (v[0] as u16) << 8 | v[1] as u16,
+                ));
+                assert_eq!(ip.is_global(), is_global(ip))
+            }
+        }
+    }
 }
 
-fn get_icon(domain: &str) -> Vec<u8> {
+fn is_domain_blacklisted(domain: &str) -> bool {
+    let mut is_blacklisted = CONFIG.icon_blacklist_non_global_ips()
+        && (domain, 0)
+            .to_socket_addrs()
+            .map(|x| {
+                for ip_port in x {
+                    if !is_global(ip_port.ip()) {
+                        warn!("IP {} for domain '{}' is not a global IP!", ip_port.ip(), domain);
+                        return true;
+                    }
+                }
+                false
+            })
+            .unwrap_or(false);
+
+    // Skip the regex check if the previous one is true already
+    if !is_blacklisted {
+        if let Some(blacklist) = CONFIG.icon_blacklist_regex() {
+            let mut regex_hashmap = ICON_BLACKLIST_REGEX.read().unwrap();
+
+            // Use the pre-generate Regex stored in a Lazy HashMap if there's one, else generate it.
+            let regex = if let Some(regex) = regex_hashmap.get(&blacklist) {
+                regex
+            } else {
+                drop(regex_hashmap);
+
+                let mut regex_hashmap_write = ICON_BLACKLIST_REGEX.write().unwrap();
+                // Clear the current list if the previous key doesn't exists.
+                // To prevent growing of the HashMap after someone has changed it via the admin interface.
+                if regex_hashmap_write.len() >= 1 {
+                    regex_hashmap_write.clear();
+                }
+
+                // Generate the regex to store in too the Lazy Static HashMap.
+                let blacklist_regex = Regex::new(&blacklist).unwrap();
+                regex_hashmap_write.insert(blacklist.to_string(), blacklist_regex);
+                drop(regex_hashmap_write);
+
+                regex_hashmap = ICON_BLACKLIST_REGEX.read().unwrap();
+                regex_hashmap.get(&blacklist).unwrap()
+            };
+
+            // Use the pre-generate Regex stored in a Lazy HashMap.
+            if regex.is_match(&domain) {
+                warn!("Blacklisted domain: {:#?} matched {:#?}", domain, blacklist);
+                is_blacklisted = true;
+            }
+        }
+    }
+
+    is_blacklisted
+}
+
+fn get_icon(domain: &str) -> Option<Vec<u8>> {
     let path = format!("{}/{}.png", CONFIG.icon_cache_folder(), domain);
 
+    // Check for expiration of negatively cached copy
+    if icon_is_negcached(&path) {
+        return None;
+    }
+
     if let Some(icon) = get_cached_icon(&path) {
-        return icon;
+        return Some(icon);
     }
 
     if CONFIG.disable_icon_download() {
-        return FALLBACK_ICON.to_vec();
+        return None;
     }
 
-    // Get the icon, or fallback in case of error
+    // Get the icon, or None in case of error
     match download_icon(&domain) {
         Ok(icon) => {
             save_icon(&path, &icon);
-            icon
+            Some(icon)
         }
         Err(e) => {
             error!("Error downloading icon: {:?}", e);
-            mark_negcache(&path);
-            FALLBACK_ICON.to_vec()
+            let miss_indicator = path + ".miss";
+            save_icon(&miss_indicator, &[]);
+            None
         }
     }
 }
 
 fn get_cached_icon(path: &str) -> Option<Vec<u8>> {
-    // Check for expiration of negatively cached copy
-    if icon_is_negcached(path) {
-        return Some(FALLBACK_ICON.to_vec());
-    }
-
     // Check for expiration of successfully cached copy
     if icon_is_expired(path) {
         return None;
@@ -150,11 +307,6 @@ fn icon_is_negcached(path: &str) -> bool {
     }
 }
 
-fn mark_negcache(path: &str) {
-    let miss_indicator = path.to_owned() + ".miss";
-    File::create(&miss_indicator).expect("Error creating negative cache marker");
-}
-
 fn icon_is_expired(path: &str) -> bool {
     let expired = file_is_expired(path, CONFIG.icon_cache_ttl());
     expired.unwrap_or(true)
@@ -167,7 +319,7 @@ struct Icon {
 }
 
 impl Icon {
-    fn new(priority: u8, href: String) -> Self {
+    const fn new(priority: u8, href: String) -> Self {
         Self { href, priority }
     }
 }
@@ -197,35 +349,88 @@ fn get_icon_url(domain: &str) -> Result<(Vec<Icon>, String), Error> {
     // Some sites have extra security in place with for example XSRF Tokens.
     let mut cookie_str = String::new();
 
-    let resp = get_page(&ssldomain).or_else(|_| get_page(&httpdomain));
+    // First check the domain as given during the request for both HTTPS and HTTP.
+    let resp = match get_page(&ssldomain).or_else(|_| get_page(&httpdomain)) {
+        Ok(c) => Ok(c),
+        Err(e) => {
+            let mut sub_resp = Err(e);
+
+            // When the domain is not an IP, and has more then one dot, remove all subdomains.
+            let is_ip = domain.parse::<IpAddr>();
+            if is_ip.is_err() && domain.matches('.').count() > 1 {
+                let mut domain_parts = domain.split('.');
+                let base_domain = format!(
+                    "{base}.{tld}",
+                    tld = domain_parts.next_back().unwrap(),
+                    base = domain_parts.next_back().unwrap()
+                );
+                if is_valid_domain(&base_domain) {
+                    let sslbase = format!("https://{}", base_domain);
+                    let httpbase = format!("http://{}", base_domain);
+                    debug!("[get_icon_url]: Trying without subdomains '{}'", base_domain);
+
+                    sub_resp = get_page(&sslbase).or_else(|_| get_page(&httpbase));
+                }
+
+            // When the domain is not an IP, and has less then 2 dots, try to add www. infront of it.
+            } else if is_ip.is_err() && domain.matches('.').count() < 2 {
+                let www_domain = format!("www.{}", domain);
+                if is_valid_domain(&www_domain) {
+                    let sslwww = format!("https://{}", www_domain);
+                    let httpwww = format!("http://{}", www_domain);
+                    debug!("[get_icon_url]: Trying with www. prefix '{}'", www_domain);
+
+                    sub_resp = get_page(&sslwww).or_else(|_| get_page(&httpwww));
+                }
+            }
+
+            sub_resp
+        }
+    };
+
     if let Ok(content) = resp {
         // Extract the URL from the respose in case redirects occured (like @ gitlab.com)
         let url = content.url().clone();
+
+        // Get all the cookies and pass it on to the next function.
+        // Needed for XSRF Cookies for example (like @ mijn.ing.nl)
         let raw_cookies = content.headers().get_all("set-cookie");
         cookie_str = raw_cookies
             .iter()
-            .map(|raw_cookie| {
-                let cookie = Cookie::parse(raw_cookie.to_str().unwrap_or_default()).unwrap();
-                format!("{}={}; ", cookie.name(), cookie.value())
+            .filter_map(|raw_cookie| raw_cookie.to_str().ok())
+            .map(|cookie_str| {
+                if let Ok(cookie) = Cookie::parse(cookie_str) {
+                    format!("{}={}; ", cookie.name(), cookie.value())
+                } else {
+                    String::new()
+                }
             })
             .collect::<String>();
 
         // Add the default favicon.ico to the list with the domain the content responded from.
         iconlist.push(Icon::new(35, url.join("/favicon.ico").unwrap().into_string()));
 
-        let soup = Soup::from_reader(content)?;
+        // 512KB should be more than enough for the HTML, though as we only really need
+        // the HTML header, it could potentially be reduced even further
+        let limited_reader = content.take(512 * 1024);
+
+        let soup = Soup::from_reader(limited_reader)?;
         // Search for and filter
         let favicons = soup
             .tag("link")
-            .attr("rel", Regex::new(r"icon$|apple.*icon")?) // Only use icon rels
-            .attr("href", Regex::new(r"(?i)\w+\.(jpg|jpeg|png|ico)(\?.*)?$")?) // Only allow specific extensions
+            .attr("rel", ICON_REL_REGEX.clone()) // Only use icon rels
+            .attr_name("href") // Make sure there is a href
             .find_all();
 
         // Loop through all the found icons and determine it's priority
         for favicon in favicons {
             let sizes = favicon.get("sizes");
-            let href = favicon.get("href").expect("Missing href");
-            let full_href = url.join(&href).unwrap().into_string();
+            let href = favicon.get("href").unwrap();
+            // Skip invalid url's
+            let full_href = match url.join(&href) {
+                Ok(h) => h.into_string(),
+                _ => continue,
+            };
 
             let priority = get_icon_priority(&full_href, sizes);
 
@@ -234,6 +439,7 @@ fn get_icon_url(domain: &str) -> Result<(Vec<Icon>, String), Error> {
     } else {
         // Add the default favicon.ico to the list with just the given domain
         iconlist.push(Icon::new(35, format!("{}/favicon.ico", ssldomain)));
+        iconlist.push(Icon::new(35, format!("{}/favicon.ico", httpdomain)));
     }
 
     // Sort the iconlist by priority
@@ -248,10 +454,16 @@ fn get_page(url: &str) -> Result<Response, Error> {
 }
 
 fn get_page_with_cookies(url: &str, cookie_str: &str) -> Result<Response, Error> {
-    CLIENT
-        .get(url)
-        .header("cookie", cookie_str)
-        .send()?
+    if is_domain_blacklisted(Url::parse(url).unwrap().host_str().unwrap_or_default()) {
+        err!("Favicon rel linked to a blacklisted domain!");
+    }
+
+    let mut client = CLIENT.get(url);
+    if !cookie_str.is_empty() {
+        client = client.header("cookie", cookie_str)
+    }
+
+    client.send()?
         .error_for_status()
         .map_err(Into::into)
 }
@@ -321,7 +533,7 @@ fn parse_sizes(sizes: Option<String>) -> (u16, u16) {
     let mut height: u16 = 0;
 
     if let Some(sizes) = sizes {
-        match Regex::new(r"(?x)(\d+)\D*(\d+)").unwrap().captures(sizes.trim()) {
+        match ICON_SIZE_REGEX.captures(sizes.trim()) {
             None => {}
             Some(dimensions) => {
                 if dimensions.len() >= 3 {
@@ -336,19 +548,40 @@ fn parse_sizes(sizes: Option<String>) -> (u16, u16) {
 }
 
 fn download_icon(domain: &str) -> Result<Vec<u8>, Error> {
+    if is_domain_blacklisted(domain) {
+        err!("Domain is blacklisted", domain)
+    }
+
     let (iconlist, cookie_str) = get_icon_url(&domain)?;
 
     let mut buffer = Vec::new();
 
+    use data_url::DataUrl;
+
     for icon in iconlist.iter().take(5) {
-        match get_page_with_cookies(&icon.href, &cookie_str) {
-            Ok(mut res) => {
-                info!("Downloaded icon from {}", icon.href);
-                res.copy_to(&mut buffer)?;
-                break;
-            }
-            Err(_) => info!("Download failed for {}", icon.href),
-        };
+        if icon.href.starts_with("data:image") {
+            let datauri = DataUrl::process(&icon.href).unwrap();
+            // Check if we are able to decode the data uri
+            match datauri.decode_to_vec() {
+                Ok((body, _fragment)) => {
+                    // Also check if the size is atleast 67 bytes, which seems to be the smallest png i could create
+                    if body.len() >= 67 {
+                        buffer = body;
+                        break;
+                    }
+                }
+                _ => warn!("data uri is invalid"),
+            };
+        } else {
+            match get_page_with_cookies(&icon.href, &cookie_str) {
+                Ok(mut res) => {
+                    info!("Downloaded icon from {}", icon.href);
+                    res.copy_to(&mut buffer)?;
+                    break;
+                }
+                Err(_) => warn!("Download failed for {}", icon.href),
+            };
+        }
     }
 
     if buffer.is_empty() {
@@ -359,11 +592,17 @@ fn download_icon(domain: &str) -> Result<Vec<u8>, Error> {
 }
 
 fn save_icon(path: &str, icon: &[u8]) {
-    create_dir_all(&CONFIG.icon_cache_folder()).expect("Error creating icon cache");
-
-    if let Ok(mut f) = File::create(path) {
-        f.write_all(icon).expect("Error writing icon file");
-    };
+    match File::create(path) {
+        Ok(mut f) => {
+            f.write_all(icon).expect("Error writing icon file");
+        }
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+            create_dir_all(&CONFIG.icon_cache_folder()).expect("Error creating icon cache");
+        }
+        Err(e) => {
+            info!("Icon save error: {:?}", e);
+        }
+    }
 }
 
 fn _header_map() -> HeaderMap {

@@ -1,36 +1,40 @@
 //
 // JWT Handling
 //
-use crate::util::read_file;
 use chrono::{Duration, Utc};
+use num_traits::FromPrimitive;
+use once_cell::sync::Lazy;
 
-use jsonwebtoken::{self, Algorithm, Header};
+use jsonwebtoken::{self, Algorithm, DecodingKey, EncodingKey, Header};
 use serde::de::DeserializeOwned;
 use serde::ser::Serialize;
 
-use crate::error::{Error, MapResult};
-use crate::CONFIG;
+use crate::{
+    error::{Error, MapResult},
+    util::read_file,
+    CONFIG,
+};
 
 const JWT_ALGORITHM: Algorithm = Algorithm::RS256;
 
-lazy_static! {
-    pub static ref DEFAULT_VALIDITY: Duration = Duration::hours(2);
-    static ref JWT_HEADER: Header = Header::new(JWT_ALGORITHM);
-    pub static ref JWT_LOGIN_ISSUER: String = format!("{}|login", CONFIG.domain());
-    pub static ref JWT_INVITE_ISSUER: String = format!("{}|invite", CONFIG.domain());
-    pub static ref JWT_ADMIN_ISSUER: String = format!("{}|admin", CONFIG.domain());
-    static ref PRIVATE_RSA_KEY: Vec<u8> = match read_file(&CONFIG.private_rsa_key()) {
-        Ok(key) => key,
-        Err(e) => panic!("Error loading private RSA Key.\n Error: {}", e),
-    };
-    static ref PUBLIC_RSA_KEY: Vec<u8> = match read_file(&CONFIG.public_rsa_key()) {
-        Ok(key) => key,
-        Err(e) => panic!("Error loading public RSA Key.\n Error: {}", e),
-    };
-}
+pub static DEFAULT_VALIDITY: Lazy<Duration> = Lazy::new(|| Duration::hours(2));
+static JWT_HEADER: Lazy<Header> = Lazy::new(|| Header::new(JWT_ALGORITHM));
+pub static JWT_LOGIN_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|login", CONFIG.domain_origin()));
+static JWT_INVITE_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|invite", CONFIG.domain_origin()));
+static JWT_DELETE_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|delete", CONFIG.domain_origin()));
+static JWT_VERIFYEMAIL_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|verifyemail", CONFIG.domain_origin()));
+static JWT_ADMIN_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|admin", CONFIG.domain_origin()));
+static PRIVATE_RSA_KEY: Lazy<Vec<u8>> = Lazy::new(|| match read_file(&CONFIG.private_rsa_key()) {
+    Ok(key) => key,
+    Err(e) => panic!("Error loading private RSA Key.\n Error: {}", e),
+});
+static PUBLIC_RSA_KEY: Lazy<Vec<u8>> = Lazy::new(|| match read_file(&CONFIG.public_rsa_key()) {
+    Ok(key) => key,
+    Err(e) => panic!("Error loading public RSA Key.\n Error: {}", e),
+});
 
 pub fn encode_jwt<T: Serialize>(claims: &T) -> String {
-    match jsonwebtoken::encode(&JWT_HEADER, claims, &PRIVATE_RSA_KEY) {
+    match jsonwebtoken::encode(&JWT_HEADER, claims, &EncodingKey::from_rsa_der(&PRIVATE_RSA_KEY)) {
         Ok(token) => token,
         Err(e) => panic!("Error encoding jwt {}", e),
     }
@@ -49,7 +53,7 @@ fn decode_jwt<T: DeserializeOwned>(token: &str, issuer: String) -> Result<T, Err
 
     let token = token.replace(char::is_whitespace, "");
 
-    jsonwebtoken::decode(&token, &PUBLIC_RSA_KEY, &validation)
+    jsonwebtoken::decode(&token, &DecodingKey::from_rsa_der(&PUBLIC_RSA_KEY), &validation)
         .map(|d| d.claims)
         .map_res("Error decoding JWT")
 }
@@ -60,6 +64,14 @@ pub fn decode_login(token: &str) -> Result<LoginJWTClaims, Error> {
 
 pub fn decode_invite(token: &str) -> Result<InviteJWTClaims, Error> {
     decode_jwt(token, JWT_INVITE_ISSUER.to_string())
+}
+
+pub fn decode_delete(token: &str) -> Result<DeleteJWTClaims, Error> {
+    decode_jwt(token, JWT_DELETE_ISSUER.to_string())
+}
+
+pub fn decode_verify_email(token: &str) -> Result<VerifyEmailJWTClaims, Error> {
+    decode_jwt(token, JWT_VERIFYEMAIL_ISSUER.to_string())
 }
 
 pub fn decode_admin(token: &str) -> Result<AdminJWTClaims, Error> {
@@ -118,7 +130,7 @@ pub fn generate_invite_claims(
     uuid: String,
     email: String,
     org_id: Option<String>,
-    org_user_id: Option<String>,
+    user_org_id: Option<String>,
     invited_by_email: Option<String>,
 ) -> InviteJWTClaims {
     let time_now = Utc::now().naive_utc();
@@ -126,11 +138,55 @@ pub fn generate_invite_claims(
         nbf: time_now.timestamp(),
         exp: (time_now + Duration::days(5)).timestamp(),
         iss: JWT_INVITE_ISSUER.to_string(),
-        sub: uuid.clone(),
-        email: email.clone(),
-        org_id: org_id.clone(),
-        user_org_id: org_user_id.clone(),
-        invited_by_email: invited_by_email.clone(),
+        sub: uuid,
+        email,
+        org_id,
+        user_org_id,
+        invited_by_email,
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeleteJWTClaims {
+    // Not before
+    pub nbf: i64,
+    // Expiration time
+    pub exp: i64,
+    // Issuer
+    pub iss: String,
+    // Subject
+    pub sub: String,
+}
+
+pub fn generate_delete_claims(uuid: String) -> DeleteJWTClaims {
+    let time_now = Utc::now().naive_utc();
+    DeleteJWTClaims {
+        nbf: time_now.timestamp(),
+        exp: (time_now + Duration::days(5)).timestamp(),
+        iss: JWT_DELETE_ISSUER.to_string(),
+        sub: uuid,
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VerifyEmailJWTClaims {
+    // Not before
+    pub nbf: i64,
+    // Expiration time
+    pub exp: i64,
+    // Issuer
+    pub iss: String,
+    // Subject
+    pub sub: String,
+}
+
+pub fn generate_verify_email_claims(uuid: String) -> DeleteJWTClaims {
+    let time_now = Utc::now().naive_utc();
+    DeleteJWTClaims {
+        nbf: time_now.timestamp(),
+        exp: (time_now + Duration::days(5)).timestamp(),
+        iss: JWT_VERIFYEMAIL_ISSUER.to_string(),
+        sub: uuid,
     }
 }
 
@@ -159,11 +215,14 @@ pub fn generate_admin_claims() -> AdminJWTClaims {
 //
 // Bearer token authentication
 //
-use rocket::request::{self, FromRequest, Request};
-use rocket::Outcome;
+use rocket::{
+    request::{FromRequest, Request, Outcome},
+};
 
-use crate::db::models::{Device, User, UserOrgStatus, UserOrgType, UserOrganization};
-use crate::db::DbConn;
+use crate::db::{
+    models::{Device, User, UserOrgStatus, UserOrgType, UserOrganization, CollectionUser},
+    DbConn,
+};
 
 pub struct Headers {
     pub host: String,
@@ -174,7 +233,7 @@ pub struct Headers {
 impl<'a, 'r> FromRequest<'a, 'r> for Headers {
     type Error = &'static str;
 
-    fn from_request(request: &'a Request<'r>) -> request::Outcome<Self, Self::Error> {
+    fn from_request(request: &'a Request<'r>) -> Outcome<Self, Self::Error> {
         let headers = request.headers();
 
         // Get host
@@ -251,19 +310,39 @@ pub struct OrgHeaders {
     pub device: Device,
     pub user: User,
     pub org_user_type: UserOrgType,
+    pub org_user: UserOrganization,
+    pub org_id: String,
+}
+
+// org_id is usually the second param ("/organizations/<org_id>")
+// But there are cases where it is located in a query value.
+// First check the param, if this is not a valid uuid, we will try the query value.
+fn get_org_id(request: &Request) -> Option<String> {
+    if let Some(Ok(org_id)) = request.get_param::<String>(1) {
+        if uuid::Uuid::parse_str(&org_id).is_ok() {
+            return Some(org_id);
+        }
+    }
+
+    if let Some(Ok(org_id)) = request.get_query_value::<String>("organizationId") {
+        if uuid::Uuid::parse_str(&org_id).is_ok() {
+            return Some(org_id);
+        }
+    }
+
+    None
 }
 
 impl<'a, 'r> FromRequest<'a, 'r> for OrgHeaders {
     type Error = &'static str;
 
-    fn from_request(request: &'a Request<'r>) -> request::Outcome<Self, Self::Error> {
+    fn from_request(request: &'a Request<'r>) -> Outcome<Self, Self::Error> {
         match request.guard::<Headers>() {
             Outcome::Forward(_) => Outcome::Forward(()),
             Outcome::Failure(f) => Outcome::Failure(f),
             Outcome::Success(headers) => {
-                // org_id is expected to be the second param ("/organizations/<org_id>")
-                match request.get_param::<String>(1) {
-                    Some(Ok(org_id)) => {
+                match get_org_id(request) {
+                    Some(org_id) => {
                         let conn = match request.guard::<DbConn>() {
                             Outcome::Success(conn) => conn,
                             _ => err_handler!("Error getting DB"),
@@ -293,6 +372,8 @@ impl<'a, 'r> FromRequest<'a, 'r> for OrgHeaders {
                                     err_handler!("Unknown user type in the database")
                                 }
                             },
+                            org_user,
+                            org_id,
                         })
                     }
                     _ => err_handler!("Error getting the organization id"),
@@ -312,7 +393,7 @@ pub struct AdminHeaders {
 impl<'a, 'r> FromRequest<'a, 'r> for AdminHeaders {
     type Error = &'static str;
 
-    fn from_request(request: &'a Request<'r>) -> request::Outcome<Self, Self::Error> {
+    fn from_request(request: &'a Request<'r>) -> Outcome<Self, Self::Error> {
         match request.guard::<OrgHeaders>() {
             Outcome::Forward(_) => Outcome::Forward(()),
             Outcome::Failure(f) => Outcome::Failure(f),
@@ -332,6 +413,141 @@ impl<'a, 'r> FromRequest<'a, 'r> for AdminHeaders {
     }
 }
 
+impl Into<Headers> for AdminHeaders {
+    fn into(self) -> Headers {
+        Headers {
+            host: self.host,
+            device: self.device,
+            user: self.user,
+        }
+    }
+}
+
+
+
+
+
+// col_id is usually the forth param ("/organizations/<org_id>/collections/<col_id>")
+// But there cloud be cases where it is located in a query value.
+// First check the param, if this is not a valid uuid, we will try the query value.
+fn get_col_id(request: &Request) -> Option<String> {
+    if let Some(Ok(col_id)) = request.get_param::<String>(3) {
+        if uuid::Uuid::parse_str(&col_id).is_ok() {
+            return Some(col_id);
+        }
+    }
+
+    if let Some(Ok(col_id)) = request.get_query_value::<String>("collectionId") {
+        if uuid::Uuid::parse_str(&col_id).is_ok() {
+            return Some(col_id);
+        }
+    }
+
+    None
+}
+
+/// The ManagerHeaders are used to check if you are at least a Manager
+/// and have access to the specific collection provided via the <col_id>/collections/collectionId.
+/// This does strict checking on the collection_id, ManagerHeadersLoose does not.
+pub struct ManagerHeaders {
+    pub host: String,
+    pub device: Device,
+    pub user: User,
+    pub org_user_type: UserOrgType,
+}
+
+impl<'a, 'r> FromRequest<'a, 'r> for ManagerHeaders {
+    type Error = &'static str;
+
+    fn from_request(request: &'a Request<'r>) -> Outcome<Self, Self::Error> {
+        match request.guard::<OrgHeaders>() {
+            Outcome::Forward(_) => Outcome::Forward(()),
+            Outcome::Failure(f) => Outcome::Failure(f),
+            Outcome::Success(headers) => {
+                if headers.org_user_type >= UserOrgType::Manager {
+                    match get_col_id(request) {
+                        Some(col_id) => {
+                            let conn = match request.guard::<DbConn>() {
+                                Outcome::Success(conn) => conn,
+                                _ => err_handler!("Error getting DB"),
+                            };
+
+                            if !headers.org_user.access_all {
+                                match CollectionUser::find_by_collection_and_user(&col_id, &headers.org_user.user_uuid, &conn) {
+                                    Some(_) => (),
+                                    None => err_handler!("The current user isn't a manager for this collection"),
+                                }
+                            }
+                        },
+                        _ => err_handler!("Error getting the collection id"),
+                    }
+
+                    Outcome::Success(Self {
+                        host: headers.host,
+                        device: headers.device,
+                        user: headers.user,
+                        org_user_type: headers.org_user_type,
+                    })
+                } else {
+                    err_handler!("You need to be a Manager, Admin or Owner to call this endpoint")
+                }
+            }
+        }
+    }
+}
+
+impl Into<Headers> for ManagerHeaders {
+    fn into(self) -> Headers {
+        Headers {
+            host: self.host,
+            device: self.device,
+            user: self.user,
+        }
+    }
+}
+
+/// The ManagerHeadersLoose is used when you at least need to be a Manager,
+/// but there is no collection_id sent with the request (either in the path or as form data).
+pub struct ManagerHeadersLoose {
+    pub host: String,
+    pub device: Device,
+    pub user: User,
+    pub org_user_type: UserOrgType,
+}
+
+impl<'a, 'r> FromRequest<'a, 'r> for ManagerHeadersLoose {
+    type Error = &'static str;
+
+    fn from_request(request: &'a Request<'r>) -> Outcome<Self, Self::Error> {
+        match request.guard::<OrgHeaders>() {
+            Outcome::Forward(_) => Outcome::Forward(()),
+            Outcome::Failure(f) => Outcome::Failure(f),
+            Outcome::Success(headers) => {
+                if headers.org_user_type >= UserOrgType::Manager {
+                    Outcome::Success(Self {
+                        host: headers.host,
+                        device: headers.device,
+                        user: headers.user,
+                        org_user_type: headers.org_user_type,
+                    })
+                } else {
+                    err_handler!("You need to be a Manager, Admin or Owner to call this endpoint")
+                }
+            }
+        }
+    }
+}
+
+impl Into<Headers> for ManagerHeadersLoose {
+    fn into(self) -> Headers {
+        Headers {
+            host: self.host,
+            device: self.device,
+            user: self.user,
+        }
+    }
+}
+
 pub struct OwnerHeaders {
     pub host: String,
     pub device: Device,
@@ -341,7 +557,7 @@ pub struct OwnerHeaders {
 impl<'a, 'r> FromRequest<'a, 'r> for OwnerHeaders {
     type Error = &'static str;
 
-    fn from_request(request: &'a Request<'r>) -> request::Outcome<Self, Self::Error> {
+    fn from_request(request: &'a Request<'r>) -> Outcome<Self, Self::Error> {
         match request.guard::<OrgHeaders>() {
             Outcome::Forward(_) => Outcome::Forward(()),
             Outcome::Failure(f) => Outcome::Failure(f),
@@ -372,11 +588,24 @@ pub struct ClientIp {
 impl<'a, 'r> FromRequest<'a, 'r> for ClientIp {
     type Error = ();
 
-    fn from_request(request: &'a Request<'r>) -> request::Outcome<Self, Self::Error> {
-        let ip = match request.client_ip() {
-            Some(addr) => addr,
-            None => "0.0.0.0".parse().unwrap(),
+    fn from_request(req: &'a Request<'r>) -> Outcome<Self, Self::Error> {
+        let ip = if CONFIG._ip_header_enabled() {
+            req.headers().get_one(&CONFIG.ip_header()).and_then(|ip| {
+                match ip.find(',') {
+                    Some(idx) => &ip[..idx],
+                    None => ip,
+                }
+                .parse()
+                .map_err(|_| warn!("'{}' header is malformed: {}", CONFIG.ip_header(), ip))
+                .ok()
+            })
+        } else {
+            None
         };
+
+        let ip = ip
+            .or_else(|| req.remote().map(|r| r.ip()))
+            .unwrap_or_else(|| "0.0.0.0".parse().unwrap());
 
         Outcome::Success(ClientIp { ip })
     }

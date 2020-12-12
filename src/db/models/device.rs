@@ -1,26 +1,30 @@
 use chrono::{NaiveDateTime, Utc};
 
 use super::User;
+use crate::CONFIG;
 
-#[derive(Debug, Identifiable, Queryable, Insertable, Associations)]
-#[table_name = "devices"]
-#[belongs_to(User, foreign_key = "user_uuid")]
-#[primary_key(uuid)]
-pub struct Device {
-    pub uuid: String,
-    pub created_at: NaiveDateTime,
-    pub updated_at: NaiveDateTime,
+db_object! {
+    #[derive(Debug, Identifiable, Queryable, Insertable, Associations, AsChangeset)]
+    #[table_name = "devices"]
+    #[changeset_options(treat_none_as_null="true")]
+    #[belongs_to(User, foreign_key = "user_uuid")]
+    #[primary_key(uuid)]
+    pub struct Device {
+        pub uuid: String,
+        pub created_at: NaiveDateTime,
+        pub updated_at: NaiveDateTime,
 
-    pub user_uuid: String,
+        pub user_uuid: String,
 
-    pub name: String,
-    /// https://github.com/bitwarden/core/tree/master/src/Core/Enums
-    pub atype: i32,
-    pub push_token: Option<String>,
+        pub name: String,
+        // https://github.com/bitwarden/core/tree/master/src/Core/Enums
+        pub atype: i32,
+        pub push_token: Option<String>,
 
-    pub refresh_token: String,
+        pub refresh_token: String,
 
-    pub twofactor_remember: Option<String>,
+        pub twofactor_remember: Option<String>,
+    }
 }
 
 /// Local methods
@@ -75,7 +79,6 @@ impl Device {
         let orguser: Vec<_> = orgs.iter().filter(|o| o.atype == 2).map(|o| o.org_uuid.clone()).collect();
         let orgmanager: Vec<_> = orgs.iter().filter(|o| o.atype == 3).map(|o| o.org_uuid.clone()).collect();
 
-
         // Create the JWT claims struct, to send to the client
         use crate::auth::{encode_jwt, LoginJWTClaims, DEFAULT_VALIDITY, JWT_LOGIN_ISSUER};
         let claims = LoginJWTClaims {
@@ -87,7 +90,7 @@ impl Device {
             premium: true,
             name: user.name.to_string(),
             email: user.email.to_string(),
-            email_verified: true,
+            email_verified: !CONFIG.mail_enabled() || user.verified_at.is_some(),
 
             orgowner,
             orgadmin,
@@ -104,10 +107,7 @@ impl Device {
     }
 }
 
-use crate::db::schema::devices;
 use crate::db::DbConn;
-use diesel;
-use diesel::prelude::*;
 
 use crate::api::EmptyResult;
 use crate::error::MapResult;
@@ -117,17 +117,29 @@ impl Device {
     pub fn save(&mut self, conn: &DbConn) -> EmptyResult {
         self.updated_at = Utc::now().naive_utc();
 
-        crate::util::retry(
-            || diesel::replace_into(devices::table).values(&*self).execute(&**conn),
-            10,
-        )
-        .map_res("Error saving device")
+        db_run! { conn: 
+            sqlite, mysql {
+                crate::util::retry(
+                    || diesel::replace_into(devices::table).values(DeviceDb::to_db(self)).execute(conn),
+                    10,
+                ).map_res("Error saving device")
+            }
+            postgresql {
+                let value = DeviceDb::to_db(self);
+                crate::util::retry(
+                    || diesel::insert_into(devices::table).values(&value).on_conflict(devices::uuid).do_update().set(&value).execute(conn),
+                    10,
+                ).map_res("Error saving device")
+            }
+        }
     }
 
     pub fn delete(self, conn: &DbConn) -> EmptyResult {
-        diesel::delete(devices::table.filter(devices::uuid.eq(self.uuid)))
-            .execute(&**conn)
-            .map_res("Error removing device")
+        db_run! { conn: {
+            diesel::delete(devices::table.filter(devices::uuid.eq(self.uuid)))
+                .execute(conn)
+                .map_res("Error removing device")
+        }}
     }
 
     pub fn delete_all_by_user(user_uuid: &str, conn: &DbConn) -> EmptyResult {
@@ -138,23 +150,43 @@ impl Device {
     }
 
     pub fn find_by_uuid(uuid: &str, conn: &DbConn) -> Option<Self> {
-        devices::table
-            .filter(devices::uuid.eq(uuid))
-            .first::<Self>(&**conn)
-            .ok()
+        db_run! { conn: {
+            devices::table
+                .filter(devices::uuid.eq(uuid))
+                .first::<DeviceDb>(conn)
+                .ok()
+                .from_db()
+        }}
     }
 
     pub fn find_by_refresh_token(refresh_token: &str, conn: &DbConn) -> Option<Self> {
-        devices::table
-            .filter(devices::refresh_token.eq(refresh_token))
-            .first::<Self>(&**conn)
-            .ok()
+        db_run! { conn: {
+            devices::table
+                .filter(devices::refresh_token.eq(refresh_token))
+                .first::<DeviceDb>(conn)
+                .ok()
+                .from_db()
+        }}
     }
 
     pub fn find_by_user(user_uuid: &str, conn: &DbConn) -> Vec<Self> {
-        devices::table
-            .filter(devices::user_uuid.eq(user_uuid))
-            .load::<Self>(&**conn)
-            .expect("Error loading devices")
+        db_run! { conn: {
+            devices::table
+                .filter(devices::user_uuid.eq(user_uuid))
+                .load::<DeviceDb>(conn)
+                .expect("Error loading devices")
+                .from_db()
+        }}
+    }
+
+    pub fn find_latest_active_by_user(user_uuid: &str, conn: &DbConn) -> Option<Self> {
+        db_run! { conn: {
+            devices::table
+                .filter(devices::user_uuid.eq(user_uuid))
+                .order(devices::updated_at.desc())
+                .first::<DeviceDb>(conn)
+                .ok()
+                .from_db()
+        }}
     }
 }

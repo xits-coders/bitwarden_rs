@@ -1,17 +1,15 @@
+use chrono::Utc;
 use rocket_contrib::json::Json;
 
-use crate::db::models::*;
-use crate::db::DbConn;
+use crate::{
+    api::{EmptyResult, JsonResult, JsonUpcase, Notify, NumberOrString, PasswordData, UpdateType},
+    auth::{decode_delete, decode_invite, decode_verify_email, Headers},
+    crypto,
+    db::{models::*, DbConn},
+    mail, CONFIG,
+};
 
-use crate::api::{EmptyResult, JsonResult, JsonUpcase, Notify, NumberOrString, PasswordData, UpdateType};
-use crate::auth::{decode_invite, Headers};
-use crate::mail;
-
-use crate::CONFIG;
-
-use rocket::Route;
-
-pub fn routes() -> Vec<Route> {
+pub fn routes() -> Vec<rocket::Route> {
     routes![
         register,
         profile,
@@ -25,11 +23,16 @@ pub fn routes() -> Vec<Route> {
         post_sstamp,
         post_email_token,
         post_email,
+        post_verify_email,
+        post_verify_email_token,
+        post_delete_recover,
+        post_delete_recover_token,
         delete_account,
         post_delete_account,
         revision_date,
         password_hint,
         prelogin,
+        verify_password,
     ]
 }
 
@@ -62,7 +65,11 @@ fn register(data: JsonUpcase<RegisterData>, conn: DbConn) -> EmptyResult {
     let mut user = match User::find_by_mail(&data.Email, &conn) {
         Some(user) => {
             if !user.password_hash.is_empty() {
-                err!("User already exists")
+                if CONFIG.is_signup_allowed(&data.Email) {
+                    err!("User already exists")
+                } else {
+                    err!("Registration not allowed or user already exists")
+                }
             }
 
             if let Some(token) = data.Token {
@@ -79,17 +86,20 @@ fn register(data: JsonUpcase<RegisterData>, conn: DbConn) -> EmptyResult {
                 }
 
                 user
-            } else if CONFIG.signups_allowed() {
+            } else if CONFIG.is_signup_allowed(&data.Email) {
                 err!("Account with this email already exists")
             } else {
-                err!("Registration not allowed")
+                err!("Registration not allowed or user already exists")
             }
         }
         None => {
-            if CONFIG.signups_allowed() || Invitation::take(&data.Email, &conn) {
+            // Order is important here; the invitation check must come first
+            // because the bitwarden_rs admin can invite anyone, regardless
+            // of other signup restrictions.
+            if Invitation::take(&data.Email, &conn) || CONFIG.is_signup_allowed(&data.Email) {
                 User::new(data.Email.clone())
             } else {
-                err!("Registration not allowed")
+                err!("Registration not allowed or user already exists")
             }
         }
     };
@@ -120,6 +130,20 @@ fn register(data: JsonUpcase<RegisterData>, conn: DbConn) -> EmptyResult {
     if let Some(keys) = data.Keys {
         user.private_key = Some(keys.EncryptedPrivateKey);
         user.public_key = Some(keys.PublicKey);
+    }
+
+    if CONFIG.mail_enabled() {
+        if CONFIG.signups_verify() {
+            if let Err(e) = mail::send_welcome_must_verify(&user.email, &user.uuid) {
+                error!("Error sending welcome email: {:#?}", e);
+            }
+
+            user.last_verifying_at = Some(user.created_at);
+        } else {
+            if let Err(e) = mail::send_welcome(&user.email) {
+                error!("Error sending welcome email: {:#?}", e);
+            }
+        }
     }
 
     user.save(&conn)
@@ -183,7 +207,12 @@ fn post_keys(data: JsonUpcase<KeysData>, headers: Headers, conn: DbConn) -> Json
     user.public_key = Some(data.PublicKey);
 
     user.save(&conn)?;
-    Ok(Json(user.to_json(&conn)))
+
+    Ok(Json(json!({
+        "PrivateKey": user.private_key,
+        "PublicKey": user.public_key,
+        "Object":"keys"
+    })))
 }
 
 #[derive(Deserialize)]
@@ -337,8 +366,9 @@ struct EmailTokenData {
 #[post("/accounts/email-token", data = "<data>")]
 fn post_email_token(data: JsonUpcase<EmailTokenData>, headers: Headers, conn: DbConn) -> EmptyResult {
     let data: EmailTokenData = data.into_inner().data;
+    let mut user = headers.user;
 
-    if !headers.user.check_valid_password(&data.MasterPasswordHash) {
+    if !user.check_valid_password(&data.MasterPasswordHash) {
         err!("Invalid password")
     }
 
@@ -346,7 +376,21 @@ fn post_email_token(data: JsonUpcase<EmailTokenData>, headers: Headers, conn: Db
         err!("Email already in use");
     }
 
-    Ok(())
+    if !CONFIG.is_email_domain_allowed(&data.NewEmail) {
+        err!("Email domain not allowed");
+    }
+
+    let token = crypto::generate_token(6)?;
+
+    if CONFIG.mail_enabled() {
+        if let Err(e) = mail::send_change_email(&data.NewEmail, &token) {
+            error!("Error sending change-email email: {:#?}", e);
+        }
+    }
+
+    user.email_new = Some(data.NewEmail);
+    user.email_new_token = Some(token);
+    user.save(&conn)
 }
 
 #[derive(Deserialize)]
@@ -357,8 +401,7 @@ struct ChangeEmailData {
 
     Key: String,
     NewMasterPasswordHash: String,
-    #[serde(rename = "Token")]
-    _Token: NumberOrString,
+    Token: NumberOrString,
 }
 
 #[post("/accounts/email", data = "<data>")]
@@ -374,12 +417,140 @@ fn post_email(data: JsonUpcase<ChangeEmailData>, headers: Headers, conn: DbConn)
         err!("Email already in use");
     }
 
+    match user.email_new {
+        Some(ref val) => {
+            if val != &data.NewEmail {
+                err!("Email change mismatch");
+            }
+        }
+        None => err!("No email change pending"),
+    }
+
+    if CONFIG.mail_enabled() {
+        // Only check the token if we sent out an email...
+        match user.email_new_token {
+            Some(ref val) => {
+                if *val != data.Token.into_string() {
+                    err!("Token mismatch");
+                }
+            }
+            None => err!("No email change pending"),
+        }
+        user.verified_at = Some(Utc::now().naive_utc());
+    } else {
+        user.verified_at = None;
+    }
+
     user.email = data.NewEmail;
+    user.email_new = None;
+    user.email_new_token = None;
 
     user.set_password(&data.NewMasterPasswordHash);
     user.akey = data.Key;
 
     user.save(&conn)
+}
+
+#[post("/accounts/verify-email")]
+fn post_verify_email(headers: Headers, _conn: DbConn) -> EmptyResult {
+    let user = headers.user;
+
+    if !CONFIG.mail_enabled() {
+        err!("Cannot verify email address");
+    }
+
+    if let Err(e) = mail::send_verify_email(&user.email, &user.uuid) {
+        error!("Error sending verify_email email: {:#?}", e);
+    }
+
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[allow(non_snake_case)]
+struct VerifyEmailTokenData {
+    UserId: String,
+    Token: String,
+}
+
+#[post("/accounts/verify-email-token", data = "<data>")]
+fn post_verify_email_token(data: JsonUpcase<VerifyEmailTokenData>, conn: DbConn) -> EmptyResult {
+    let data: VerifyEmailTokenData = data.into_inner().data;
+
+    let mut user = match User::find_by_uuid(&data.UserId, &conn) {
+        Some(user) => user,
+        None => err!("User doesn't exist"),
+    };
+
+    let claims = match decode_verify_email(&data.Token) {
+        Ok(claims) => claims,
+        Err(_) => err!("Invalid claim"),
+    };
+    if claims.sub != user.uuid {
+        err!("Invalid claim");
+    }
+    user.verified_at = Some(Utc::now().naive_utc());
+    user.last_verifying_at = None;
+    user.login_verify_count = 0;
+    if let Err(e) = user.save(&conn) {
+        error!("Error saving email verification: {:#?}", e);
+    }
+
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[allow(non_snake_case)]
+struct DeleteRecoverData {
+    Email: String,
+}
+
+#[post("/accounts/delete-recover", data = "<data>")]
+fn post_delete_recover(data: JsonUpcase<DeleteRecoverData>, conn: DbConn) -> EmptyResult {
+    let data: DeleteRecoverData = data.into_inner().data;
+
+    let user = User::find_by_mail(&data.Email, &conn);
+
+    if CONFIG.mail_enabled() {
+        if let Some(user) = user {
+            if let Err(e) = mail::send_delete_account(&user.email, &user.uuid) {
+                error!("Error sending delete account email: {:#?}", e);
+            }
+        }
+        Ok(())
+    } else {
+        // We don't support sending emails, but we shouldn't allow anybody
+        // to delete accounts without at least logging in... And if the user
+        // cannot remember their password then they will need to contact
+        // the administrator to delete it...
+        err!("Please contact the administrator to delete your account");
+    }
+}
+
+#[derive(Deserialize)]
+#[allow(non_snake_case)]
+struct DeleteRecoverTokenData {
+    UserId: String,
+    Token: String,
+}
+
+#[post("/accounts/delete-recover-token", data = "<data>")]
+fn post_delete_recover_token(data: JsonUpcase<DeleteRecoverTokenData>, conn: DbConn) -> EmptyResult {
+    let data: DeleteRecoverTokenData = data.into_inner().data;
+
+    let user = match User::find_by_uuid(&data.UserId, &conn) {
+        Some(user) => user,
+        None => err!("User doesn't exist"),
+    };
+
+    let claims = match decode_delete(&data.Token) {
+        Ok(claims) => claims,
+        Err(_) => err!("Invalid claim"),
+    };
+    if claims.sub != user.uuid {
+        err!("Invalid claim");
+    }
+    user.delete(&conn)
 }
 
 #[post("/accounts/delete", data = "<data>")]
@@ -452,4 +623,21 @@ fn prelogin(data: JsonUpcase<PreloginData>, conn: DbConn) -> JsonResult {
         "Kdf": kdf_type,
         "KdfIterations": kdf_iter
     })))
+}
+#[derive(Deserialize)]
+#[allow(non_snake_case)]
+struct VerifyPasswordData {
+    MasterPasswordHash: String,
+}
+
+#[post("/accounts/verify-password", data = "<data>")]
+fn verify_password(data: JsonUpcase<VerifyPasswordData>, headers: Headers, _conn: DbConn) -> EmptyResult {
+    let data: VerifyPasswordData = data.into_inner().data;
+    let user = headers.user;
+
+    if !user.check_valid_password(&data.MasterPasswordHash) {
+        err!("Invalid password")
+    }
+
+    Ok(())
 }

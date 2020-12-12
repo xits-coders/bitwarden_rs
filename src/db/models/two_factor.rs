@@ -1,21 +1,28 @@
 use serde_json::Value;
 
+use crate::api::EmptyResult;
+use crate::db::DbConn;
+use crate::error::MapResult;
+
 use super::User;
 
-#[derive(Debug, Identifiable, Queryable, Insertable, Associations)]
-#[table_name = "twofactor"]
-#[belongs_to(User, foreign_key = "user_uuid")]
-#[primary_key(uuid)]
-pub struct TwoFactor {
-    pub uuid: String,
-    pub user_uuid: String,
-    pub atype: i32,
-    pub enabled: bool,
-    pub data: String,
+db_object! {
+    #[derive(Debug, Identifiable, Queryable, Insertable, Associations, AsChangeset)]
+    #[table_name = "twofactor"]
+    #[belongs_to(User, foreign_key = "user_uuid")]
+    #[primary_key(uuid)]
+    pub struct TwoFactor {
+        pub uuid: String,
+        pub user_uuid: String,
+        pub atype: i32,
+        pub enabled: bool,
+        pub data: String,
+        pub last_used: i32,
+    }
 }
 
 #[allow(dead_code)]
-#[derive(FromPrimitive)]
+#[derive(num_derive::FromPrimitive)]
 pub enum TwoFactorType {
     Authenticator = 0,
     Email = 1,
@@ -28,6 +35,7 @@ pub enum TwoFactorType {
     // These are implementation details
     U2fRegisterChallenge = 1000,
     U2fLoginChallenge = 1001,
+    EmailVerificationChallenge = 1002,
 }
 
 /// Local methods
@@ -39,6 +47,7 @@ impl TwoFactor {
             atype: atype as i32,
             enabled: true,
             data,
+            last_used: 0,
         }
     }
 
@@ -50,7 +59,7 @@ impl TwoFactor {
         })
     }
 
-    pub fn to_json_list(&self) -> Value {
+    pub fn to_json_provider(&self) -> Value {
         json!({
             "Enabled": self.enabled,
             "Type": self.atype,
@@ -59,48 +68,82 @@ impl TwoFactor {
     }
 }
 
-use crate::db::schema::twofactor;
-use crate::db::DbConn;
-use diesel;
-use diesel::prelude::*;
-
-use crate::api::EmptyResult;
-use crate::error::MapResult;
-
 /// Database methods
 impl TwoFactor {
     pub fn save(&self, conn: &DbConn) -> EmptyResult {
-        diesel::replace_into(twofactor::table)
-            .values(self)
-            .execute(&**conn)
-            .map_res("Error saving twofactor")
+        db_run! { conn:
+            sqlite, mysql {
+                match diesel::replace_into(twofactor::table)
+                    .values(TwoFactorDb::to_db(self))
+                    .execute(conn)
+                {
+                    Ok(_) => Ok(()),
+                    // Record already exists and causes a Foreign Key Violation because replace_into() wants to delete the record first.
+                    Err(diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::ForeignKeyViolation, _)) => {
+                        diesel::update(twofactor::table)
+                            .filter(twofactor::uuid.eq(&self.uuid))
+                            .set(TwoFactorDb::to_db(self))
+                            .execute(conn)
+                            .map_res("Error saving twofactor")
+                    }
+                    Err(e) => Err(e.into()),
+                }.map_res("Error saving twofactor")
+            }
+            postgresql {
+                let value = TwoFactorDb::to_db(self);
+                // We need to make sure we're not going to violate the unique constraint on user_uuid and atype.
+                // This happens automatically on other DBMS backends due to replace_into(). PostgreSQL does
+                // not support multiple constraints on ON CONFLICT clauses.
+                diesel::delete(twofactor::table.filter(twofactor::user_uuid.eq(&self.user_uuid)).filter(twofactor::atype.eq(&self.atype)))
+                    .execute(conn)
+                    .map_res("Error deleting twofactor for insert")?;
+
+                diesel::insert_into(twofactor::table)
+                    .values(&value)
+                    .on_conflict(twofactor::uuid)
+                    .do_update()
+                    .set(&value)
+                    .execute(conn)
+                    .map_res("Error saving twofactor")
+            }
+        }
     }
 
     pub fn delete(self, conn: &DbConn) -> EmptyResult {
-        diesel::delete(twofactor::table.filter(twofactor::uuid.eq(self.uuid)))
-            .execute(&**conn)
-            .map_res("Error deleting twofactor")
+        db_run! { conn: {
+            diesel::delete(twofactor::table.filter(twofactor::uuid.eq(self.uuid)))
+                .execute(conn)
+                .map_res("Error deleting twofactor")
+        }}
     }
 
     pub fn find_by_user(user_uuid: &str, conn: &DbConn) -> Vec<Self> {
-        twofactor::table
-            .filter(twofactor::user_uuid.eq(user_uuid))
-            .filter(twofactor::atype.lt(1000)) // Filter implementation types
-            .load::<Self>(&**conn)
-            .expect("Error loading twofactor")
+        db_run! { conn: {
+            twofactor::table
+                .filter(twofactor::user_uuid.eq(user_uuid))
+                .filter(twofactor::atype.lt(1000)) // Filter implementation types
+                .load::<TwoFactorDb>(conn)
+                .expect("Error loading twofactor")
+                .from_db()
+        }}
     }
 
     pub fn find_by_user_and_type(user_uuid: &str, atype: i32, conn: &DbConn) -> Option<Self> {
-        twofactor::table
-            .filter(twofactor::user_uuid.eq(user_uuid))
-            .filter(twofactor::atype.eq(atype))
-            .first::<Self>(&**conn)
-            .ok()
+        db_run! { conn: {
+            twofactor::table
+                .filter(twofactor::user_uuid.eq(user_uuid))
+                .filter(twofactor::atype.eq(atype))
+                .first::<TwoFactorDb>(conn)
+                .ok()
+                .from_db()
+        }}
     }
 
     pub fn delete_all_by_user(user_uuid: &str, conn: &DbConn) -> EmptyResult {
-        diesel::delete(twofactor::table.filter(twofactor::user_uuid.eq(user_uuid)))
-            .execute(&**conn)
-            .map_res("Error deleting twofactors")
+        db_run! { conn: {
+            diesel::delete(twofactor::table.filter(twofactor::user_uuid.eq(user_uuid)))
+                .execute(conn)
+                .map_res("Error deleting twofactors")
+        }}
     }
 }

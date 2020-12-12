@@ -1,15 +1,13 @@
 use rocket_contrib::json::Json;
 use serde_json::Value;
 
-use crate::db::models::*;
-use crate::db::DbConn;
+use crate::{
+    api::{EmptyResult, JsonResult, JsonUpcase, Notify, UpdateType},
+    auth::Headers,
+    db::{models::*, DbConn},
+};
 
-use crate::api::{EmptyResult, JsonResult, JsonUpcase, Notify, UpdateType};
-use crate::auth::Headers;
-
-use rocket::Route;
-
-pub fn routes() -> Vec<Route> {
+pub fn routes() -> Vec<rocket::Route> {
     routes![
         get_folders,
         get_folder,
@@ -50,7 +48,6 @@ fn get_folder(uuid: String, headers: Headers, conn: DbConn) -> JsonResult {
 
 #[derive(Deserialize)]
 #[allow(non_snake_case)]
-
 pub struct FolderData {
     pub Name: String,
 }
@@ -59,7 +56,7 @@ pub struct FolderData {
 fn post_folders(data: JsonUpcase<FolderData>, headers: Headers, conn: DbConn, nt: Notify) -> JsonResult {
     let data: FolderData = data.into_inner().data;
 
-    let mut folder = Folder::new(headers.user.uuid.clone(), data.Name);
+    let mut folder = Folder::new(headers.user.uuid, data.Name);
 
     folder.save(&conn)?;
     nt.send_folder_update(UpdateType::FolderCreate, &folder);

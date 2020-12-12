@@ -2,7 +2,7 @@ mod accounts;
 mod ciphers;
 mod folders;
 mod organizations;
-pub(crate) mod two_factor;
+pub mod two_factor;
 
 pub fn routes() -> Vec<Route> {
     let mut mod_routes = routes![
@@ -29,14 +29,15 @@ pub fn routes() -> Vec<Route> {
 // Move this somewhere else
 //
 use rocket::Route;
-
 use rocket_contrib::json::Json;
 use serde_json::Value;
 
-use crate::api::{EmptyResult, JsonResult, JsonUpcase};
-use crate::auth::Headers;
-use crate::db::DbConn;
-use crate::error::Error;
+use crate::{
+    api::{EmptyResult, JsonResult, JsonUpcase},
+    auth::Headers,
+    db::DbConn,
+    error::Error,
+};
 
 #[put("/devices/identifier/<uuid>/clear-token")]
 fn clear_device_token(uuid: String) -> EmptyResult {
@@ -81,6 +82,10 @@ const GLOBAL_DOMAINS: &str = include_str!("../../static/global_domains.json");
 
 #[get("/settings/domains")]
 fn get_eq_domains(headers: Headers) -> JsonResult {
+    _get_eq_domains(headers, false)
+}
+
+fn _get_eq_domains(headers: Headers, no_excluded: bool) -> JsonResult {
     let user = headers.user;
     use serde_json::from_str;
 
@@ -91,6 +96,10 @@ fn get_eq_domains(headers: Headers) -> JsonResult {
 
     for global in &mut globals {
         global.Excluded = excluded_globals.contains(&global.Type);
+    }
+
+    if no_excluded {
+        globals.retain(|g| !g.Excluded);
     }
 
     Ok(Json(json!({
@@ -132,18 +141,43 @@ fn put_eq_domains(data: JsonUpcase<EquivDomainData>, headers: Headers, conn: DbC
 
 #[get("/hibp/breach?<username>")]
 fn hibp_breach(username: String) -> JsonResult {
-    let url = format!("https://haveibeenpwned.com/api/v2/breachedaccount/{}", username);
     let user_agent = "Bitwarden_RS";
+    let url = format!(
+        "https://haveibeenpwned.com/api/v3/breachedaccount/{}?truncateResponse=false&includeUnverified=false",
+        username
+    );
 
-    use reqwest::{header::USER_AGENT, Client};
+    use reqwest::{blocking::Client, header::USER_AGENT};
 
-    let res = Client::new().get(&url).header(USER_AGENT, user_agent).send()?;
+    if let Some(api_key) = crate::CONFIG.hibp_api_key() {
+        let hibp_client = Client::builder().build()?;
 
-    // If we get a 404, return a 404, it means no breached accounts
-    if res.status() == 404 {
-        return Err(Error::empty().with_code(404));
+        let res = hibp_client
+            .get(&url)
+            .header(USER_AGENT, user_agent)
+            .header("hibp-api-key", api_key)
+            .send()?;
+
+        // If we get a 404, return a 404, it means no breached accounts
+        if res.status() == 404 {
+            return Err(Error::empty().with_code(404));
+        }
+
+        let value: Value = res.error_for_status()?.json()?;
+        Ok(Json(value))
+    } else {
+        Ok(Json(json!([{
+            "Name": "HaveIBeenPwned",
+            "Title": "Manual HIBP Check",
+            "Domain": "haveibeenpwned.com",
+            "BreachDate": "2019-08-18T00:00:00Z",
+            "AddedDate": "2019-08-18T00:00:00Z",
+            "Description": format!("Go to: <a href=\"https://haveibeenpwned.com/account/{account}\" target=\"_blank\" rel=\"noopener\">https://haveibeenpwned.com/account/{account}</a> for a manual check.<br/><br/>HaveIBeenPwned API key not set!<br/>Go to <a href=\"https://haveibeenpwned.com/API/Key\" target=\"_blank\" rel=\"noopener\">https://haveibeenpwned.com/API/Key</a> to purchase an API key from HaveIBeenPwned.<br/><br/>", account=username),
+            "LogoPath": "bwrs_static/hibp.png",
+            "PwnCount": 0,
+            "DataClasses": [
+                "Error - No API key set!"
+            ]
+        }])))
     }
-
-    let value: Value = res.error_for_status()?.json()?;
-    Ok(Json(value))
 }
